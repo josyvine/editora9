@@ -3,10 +3,11 @@ package com.vineyard.aivideostudio.media.transformer.effects
 import android.content.Context
 import android.opengl.GLES20
 import androidx.annotation.OptIn
+import androidx.media3.common.util.GlProgram
 import androidx.media3.common.util.GlUtil
+import androidx.media3.common.util.Size
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.GlEffect
-import androidx.media3.effect.GlProgram
 import androidx.media3.effect.GlShaderProgram
 import androidx.media3.effect.SingleFrameGlShaderProgram
 
@@ -27,11 +28,11 @@ class CompositeMaskGlEffect(
     val endTimeUs: Long = Long.MAX_VALUE
 ) : GlEffect {
 
-    enum class MaskType(val typeId: Int) {
-        LINEAR_HORIZONTAL(0), // Top vs Bottom split (e.g. Toddler & Beanbag)
-        LINEAR_VERTICAL(1),   // Left vs Right split (e.g. Talking to your Clone)
-        RECTANGLE(2),         // Bounding Box matte
-        RADIAL_CIRCLE(3)      // Circular spotlight / portal matte
+    enum class MaskType(val typeId: Float) {
+        LINEAR_HORIZONTAL(0.0f), // Top vs Bottom split (e.g. Toddler & Beanbag)
+        LINEAR_VERTICAL(1.0f),   // Left vs Right split (e.g. Talking to your Clone)
+        RECTANGLE(2.0f),         // Bounding Box matte
+        RADIAL_CIRCLE(3.0f)      // Circular spotlight / portal matte
     }
 
     @OptIn(UnstableApi::class)
@@ -63,16 +64,16 @@ internal class CompositeMaskShaderProgram(
             precision mediump float;
             varying vec2 vTexCoords;
             uniform sampler2D uTexSampler;
-            uniform int uMaskType;
+            uniform float uMaskType;
             uniform float uSplitPos;
             uniform float uFeather;
-            uniform int uInvert;
-            uniform int uIsActive;
+            uniform float uInvert;
+            uniform float uIsActive;
             uniform vec4 uRectBounds;
 
             void main() {
                 vec4 baseColor = texture2D(uTexSampler, vTexCoords);
-                if (uIsActive == 0) {
+                if (uIsActive < 0.5) {
                     gl_FragColor = baseColor;
                     return;
                 }
@@ -80,26 +81,26 @@ internal class CompositeMaskShaderProgram(
                 float alpha = 1.0;
                 float feather = max(uFeather, 0.0001);
 
-                if (uMaskType == 0) {
+                if (uMaskType < 0.5) {
                     // Linear Horizontal Split
                     alpha = smoothstep(uSplitPos - feather, uSplitPos + feather, vTexCoords.y);
-                } else if (uMaskType == 1) {
+                } else if (uMaskType < 1.5) {
                     // Linear Vertical Split
                     alpha = smoothstep(uSplitPos - feather, uSplitPos + feather, vTexCoords.x);
-                } else if (uMaskType == 2) {
+                } else if (uMaskType < 2.5) {
                     // Rectangle Box
                     float left = smoothstep(uRectBounds.x - feather, uRectBounds.x + feather, vTexCoords.x);
                     float right = 1.0 - smoothstep(uRectBounds.z - feather, uRectBounds.z + feather, vTexCoords.x);
                     float top = smoothstep(uRectBounds.y - feather, uRectBounds.y + feather, vTexCoords.y);
                     float bottom = 1.0 - smoothstep(uRectBounds.w - feather, uRectBounds.w + feather, vTexCoords.y);
                     alpha = left * right * top * bottom;
-                } else if (uMaskType == 3) {
+                } else {
                     // Radial Circle
                     float dist = distance(vTexCoords, vec2(0.5, 0.5));
                     alpha = 1.0 - smoothstep(uSplitPos - feather, uSplitPos + feather, dist);
                 }
 
-                if (uInvert == 1) {
+                if (uInvert > 0.5) {
                     alpha = 1.0 - alpha;
                 }
 
@@ -109,7 +110,7 @@ internal class CompositeMaskShaderProgram(
     }
 
     init {
-        glProgram = GlProgram(context, VERTEX_SHADER, FRAGMENT_SHADER)
+        glProgram = GlProgram(VERTEX_SHADER, FRAGMENT_SHADER)
         glProgram.setBufferAttribute(
             "aFramePosition",
             GlUtil.getNormalizedCoordinateBounds(),
@@ -117,13 +118,13 @@ internal class CompositeMaskShaderProgram(
         )
     }
 
-    override fun configure(inputWidth: Int, inputHeight: Int): Pair<Int, Int> {
-        return Pair(inputWidth, inputHeight)
+    override fun configure(inputWidth: Int, inputHeight: Int): Size {
+        return Size(inputWidth, inputHeight)
     }
 
     override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
         val isActive = presentationTimeUs in effect.startTimeUs..effect.endTimeUs
-        
+
         // Dynamically interpolate split position over time if animating
         val currentSplitPos = if (isActive && effect.endTimeUs > effect.startTimeUs) {
             val progress = ((presentationTimeUs - effect.startTimeUs).toFloat() /
@@ -135,11 +136,11 @@ internal class CompositeMaskShaderProgram(
 
         glProgram.use()
         glProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, 0)
-        glProgram.setIntUniform("uMaskType", effect.maskType.typeId)
+        glProgram.setFloatUniform("uMaskType", effect.maskType.typeId)
         glProgram.setFloatUniform("uSplitPos", currentSplitPos)
         glProgram.setFloatUniform("uFeather", effect.feather)
-        glProgram.setIntUniform("uInvert", if (effect.isInverted) 1 else 0)
-        glProgram.setIntUniform("uIsActive", if (isActive) 1 else 0)
+        glProgram.setFloatUniform("uInvert", if (effect.isInverted) 1.0f else 0.0f)
+        glProgram.setFloatUniform("uIsActive", if (isActive) 1.0f else 0.0f)
         glProgram.setFloatsUniform("uRectBounds", effect.rectBounds)
         glProgram.bindAttributesAndUniforms()
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
