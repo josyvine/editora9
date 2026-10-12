@@ -55,6 +55,8 @@ import androidx.compose.ui.window.Dialog
 import com.vineyard.aivideostudio.media.tools.DetectedTargetBox
 import com.vineyard.aivideostudio.media.tools.SpatialClusterer
 import com.vineyard.aivideostudio.media.video.ExtractedFrame
+import com.vineyard.aivideostudio.ui.screens.tools.components.AddThumbnailSlotButton
+import com.vineyard.aivideostudio.ui.screens.tools.components.ImportedThumbnailFrameCard
 import com.vineyard.aivideostudio.ui.screens.tools.components.ToolsOverlayPreview
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -177,6 +179,13 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri?.let { viewModel.loadExternalTranscriptFile(it) }
+    }
+
+    // System Image Picker for Cover / Interstitial Thumbnail
+    val thumbnailPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        uri?.let { viewModel.onThumbnailSelected(it) }
     }
 
     // 1. VIDEO PLAYER & CONTROLS
@@ -622,81 +631,81 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(Color(0xFF090E1A))
                                 .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(8.dp))
-                            .padding(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                                .padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Icon(Icons.Default.Speed, contentDescription = "IDM Concurrent Engine", tint = AccentBlue, modifier = Modifier.size(16.dp))
-                                Text("IDM 10-Stream Parallel Extractor (100 Frames/Batch)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Icon(Icons.Default.Speed, contentDescription = "IDM Concurrent Engine", tint = AccentBlue, modifier = Modifier.size(16.dp))
+                                    Text("IDM 10-Stream Parallel Extractor (100 Frames/Batch)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                }
+                                Text("${state.progressPercent}%", color = SuccessGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                             }
-                            Text("${state.progressPercent}%", color = SuccessGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                        }
 
-                        // 10 Individual Worker Progress Bars in a Smooth Scrollable Column
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = 240.dp)
-                                .verticalScroll(rememberScrollState()),
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            state.workerTasks.forEach { task ->
-                                Column(modifier = Modifier.fillMaxWidth()) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween
-                                    ) {
-                                        Text(
-                                            text = "Stream #${task.taskId} (Fr ${task.startFrame} - ${task.endFrame})",
-                                            color = Color(0xFF94A3B8),
-                                            fontSize = 10.sp,
-                                            fontFamily = FontFamily.Monospace
-                                        )
-                                        Text(
-                                            text = "${task.completedFrames}/${task.totalFrames} (${task.percent}%)",
-                                            color = if (task.percent == 100) SuccessGreen else AccentBlue,
-                                            fontSize = 10.sp,
-                                            fontFamily = FontFamily.Monospace,
-                                            fontWeight = FontWeight.Bold
+                            // 10 Individual Worker Progress Bars in a Smooth Scrollable Column
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 240.dp)
+                                    .verticalScroll(rememberScrollState()),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                state.workerTasks.forEach { task ->
+                                    Column(modifier = Modifier.fillMaxWidth()) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Text(
+                                                text = "Stream #${task.taskId} (Fr ${task.startFrame} - ${task.endFrame})",
+                                                color = Color(0xFF94A3B8),
+                                                fontSize = 10.sp,
+                                                fontFamily = FontFamily.Monospace
+                                            )
+                                            Text(
+                                                text = "${task.completedFrames}/${task.totalFrames} (${task.percent}%)",
+                                                color = if (task.percent == 100) SuccessGreen else AccentBlue,
+                                                fontSize = 10.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        LinearProgressIndicator(
+                                            progress = { task.percent / 100f },
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(4.dp)
+                                                .clip(RoundedCornerShape(2.dp)),
+                                            color = if (task.percent == 100) SuccessGreen else PrimaryBlue,
+                                            trackColor = Color(0xFF1E293B)
                                         )
                                     }
-                                    Spacer(modifier = Modifier.height(2.dp))
-                                    LinearProgressIndicator(
-                                        progress = { task.percent / 100f },
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .height(4.dp)
-                                            .clip(RoundedCornerShape(2.dp)),
-                                        color = if (task.percent == 100) SuccessGreen else PrimaryBlue,
-                                        trackColor = Color(0xFF1E293B)
-                                    )
                                 }
                             }
                         }
+                    } else if (state.isProcessing && state.progressPercent > 0) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        LinearProgressIndicator(
+                            progress = { state.progressPercent / 100f },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(5.dp)
+                                .clip(RoundedCornerShape(2.dp)),
+                            color = AccentBlue,
+                            trackColor = SurfaceVariant
+                        )
                     }
-                } else if (state.isProcessing && state.progressPercent > 0) {
-                    Spacer(modifier = Modifier.height(6.dp))
-                    LinearProgressIndicator(
-                        progress = { state.progressPercent / 100f },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(5.dp)
-                            .clip(RoundedCornerShape(2.dp)),
-                        color = AccentBlue,
-                        trackColor = SurfaceVariant
-                    )
                 }
             }
         }
     }
-}
 
-    // 3. TIMELINE FILMSTRIP
+    // 3. TIMELINE FILMSTRIP (WITH INSERTABLE THUMBNAIL / COVER SUPPORT)
     if (state.frames.isNotEmpty()) {
         Card(
             colors = CardDefaults.cardColors(containerColor = SurfaceDark),
@@ -734,6 +743,21 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                         key = { it.index },
                         contentType = { "frame_thumb" }
                     ) { frame ->
+                        // Render Imported Thumbnail Card right before its targeted frame
+                        if (state.thumbnailBitmap != null && frame.index == state.thumbnailTargetIndex) {
+                            ImportedThumbnailFrameCard(
+                                bitmap = state.thumbnailBitmap!!,
+                                targetFrameIndex = state.thumbnailTargetIndex,
+                                onRemove = { viewModel.removeThumbnail() },
+                                onClick = { viewModel.seekToFrame(frame.index) }
+                            )
+                        } else if (state.thumbnailBitmap == null && frame.index == state.currentFrameIndex) {
+                            // Render "+" Slot Button right at the user's active frame selection
+                            AddThumbnailSlotButton(
+                                onClick = { thumbnailPickerLauncher.launch("image/*") }
+                            )
+                        }
+
                         FrameThumbnail(
                             frame = frame,
                             isActive = frame.index == state.currentFrameIndex,
@@ -1562,7 +1586,7 @@ private fun TerminalConsole(viewModel: ToolsViewModel, state: ToolsUiState) {
 
 // =========================================================================
 // TAB 3: RENDER VIDEO WITH REAL-TIME PROGRESS BAR
-// =========================================================
+// =========================================================================
 @Composable
 private fun RenderVideoTab(viewModel: ToolsViewModel, state: ToolsUiState) {
     Card(
