@@ -188,7 +188,7 @@ class Media3TransformerEngine(private val context: Context) {
      * 2. Muxes synthesized TTS audio track as the sole soundtrack.
      * 3. Applies hardware-accelerated Speed Ramping, GPU Shaders, and dynamic Canvas Overlays.
      * 4. Renders Presentation Text Cards (Instruction & Conclusion Slates).
-     * 5. Applies hardware CompositeMaskGlEffect when compositeLayers are present in recipe.
+     * 5. Runs Multi-Sequence Parallel decoding if compositeLayers are provided.
      */
     suspend fun exportVideo(
         inputUri: Uri,
@@ -206,7 +206,8 @@ class Media3TransformerEngine(private val context: Context) {
         textCards: List<TextCardSpec> = emptyList(),
         compositeLayers: List<RecipeCompositeLayerDto> = emptyList(),
         videoWidth: Int? = null,
-        videoHeight: Int? = null
+        videoHeight: Int? = null,
+        overlaySourceUri: Uri? = null
     ): AppResult<File> = withContext(Dispatchers.Main) {
         outputFile.parentFile?.mkdirs()
         if (outputFile.exists()) outputFile.delete()
@@ -247,46 +248,7 @@ class Media3TransformerEngine(private val context: Context) {
             sharedVideoEffects.add(ColorFilterGlEffect(colorGrade))
         }
 
-        // 5. Dynamic Composite Mask Shader (Stunts, Clones, Traveling Mattes, Wipes)
-        if (compositeLayers.isNotEmpty()) {
-            for (layer in compositeLayers) {
-                val maskDto = layer.mask
-                if (maskDto != null) {
-                    val resolvedMaskType = when (maskDto.shape.lowercase()) {
-                        "linear_vertical" -> CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
-                        "rectangle" -> CompositeMaskGlEffect.MaskType.RECTANGLE
-                        "radial_circle" -> CompositeMaskGlEffect.MaskType.RADIAL_CIRCLE
-                        else -> CompositeMaskGlEffect.MaskType.LINEAR_HORIZONTAL
-                    }
-
-                    val boundsArray = if (maskDto.bounds != null) {
-                        floatArrayOf(
-                            maskDto.bounds.left.coerceIn(0.0f, 1.0f),
-                            maskDto.bounds.top.coerceIn(0.0f, 1.0f),
-                            maskDto.bounds.right.coerceIn(0.0f, 1.0f),
-                            maskDto.bounds.bottom.coerceIn(0.0f, 1.0f)
-                        )
-                    } else {
-                        floatArrayOf(0f, 0f, 1f, 1f)
-                    }
-
-                    sharedVideoEffects.add(
-                        CompositeMaskGlEffect(
-                            maskType = resolvedMaskType,
-                            startSplitPos = maskDto.startSplitPos.coerceIn(0.0f, 1.0f),
-                            endSplitPos = maskDto.endSplitPos.coerceIn(0.0f, 1.0f),
-                            feather = maskDto.featherRadius.coerceIn(0.0001f, 0.5f),
-                            isInverted = maskDto.isInverted,
-                            rectBounds = boundsArray,
-                            startTimeUs = layer.getResolvedStartMs() * 1000L,
-                            endTimeUs = if (layer.getResolvedEndMs() > 0L) layer.getResolvedEndMs() * 1000L else Long.MAX_VALUE
-                        )
-                    )
-                }
-            }
-        }
-
-        // 6. Overlays (Captions, Dynamic Graphics & Presentation Text Cards)
+        // 5. Overlays (Captions, Dynamic Graphics & Presentation Text Cards)
         val overlayList = mutableListOf<TextureOverlay>()
 
         if (captions.isNotEmpty()) {
@@ -312,11 +274,12 @@ class Media3TransformerEngine(private val context: Context) {
             sharedVideoEffects.add(OverlayEffect(ImmutableList.copyOf(overlayList)))
         }
 
-        // Strict audio enforcement: If replacement commentary is provided, force strip original audio
         val shouldStripAudio = stripOriginalAudio || (commentaryAudioUri != null)
 
-        // 7. Build Video Sequence
-        val videoSequence = if (speedRamps.isNotEmpty()) {
+        val masterSequenceList = mutableListOf<EditedMediaItemSequence>()
+
+        // 6. Build the Base Video Sequence (Stream 1)
+        val baseSequence = if (speedRamps.isNotEmpty()) {
             buildSpeedRampedSequence(inputUri, shouldStripAudio, speedRamps, sharedVideoEffects)
         } else {
             val videoMediaItem = MediaItem.fromUri(inputUri)
@@ -325,6 +288,75 @@ class Media3TransformerEngine(private val context: Context) {
                 .setEffects(Effects(emptyList(), sharedVideoEffects))
                 .build()
             EditedMediaItemSequence(editedVideoItem)
+        }
+        masterSequenceList.add(baseSequence)
+
+        // 7. Add Parallel Overlay Video Sequences if Composite Layers exist (Stream 2+)
+        if (compositeLayers.isNotEmpty()) {
+            val sourceUriToUse = overlaySourceUri ?: inputUri
+            for (layer in compositeLayers) {
+                if (layer.layerOrder > 0) {
+                    val overlayEffects = mutableListOf<Effect>()
+                    val maskDto = layer.mask
+                    
+                    if (maskDto != null) {
+                        val resolvedMaskType = when (maskDto.shape.lowercase()) {
+                            "linear_vertical" -> CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
+                            "rectangle" -> CompositeMaskGlEffect.MaskType.RECTANGLE
+                            "radial_circle" -> CompositeMaskGlEffect.MaskType.RADIAL_CIRCLE
+                            else -> CompositeMaskGlEffect.MaskType.LINEAR_HORIZONTAL
+                        }
+
+                        val boundsArray = if (maskDto.bounds != null) {
+                            floatArrayOf(
+                                maskDto.bounds.left.coerceIn(0.0f, 1.0f),
+                                maskDto.bounds.top.coerceIn(0.0f, 1.0f),
+                                maskDto.bounds.right.coerceIn(0.0f, 1.0f),
+                                maskDto.bounds.bottom.coerceIn(0.0f, 1.0f)
+                            )
+                        } else {
+                            floatArrayOf(0f, 0f, 1f, 1f)
+                        }
+
+                        overlayEffects.add(
+                            CompositeMaskGlEffect(
+                                maskType = resolvedMaskType,
+                                startSplitPos = maskDto.startSplitPos.coerceIn(0.0f, 1.0f),
+                                endSplitPos = maskDto.endSplitPos.coerceIn(0.0f, 1.0f),
+                                feather = maskDto.featherRadius.coerceIn(0.0001f, 0.5f),
+                                isInverted = maskDto.isInverted,
+                                rectBounds = boundsArray,
+                                startTimeUs = 0L, // Handled automatically by sequence timing
+                                endTimeUs = Long.MAX_VALUE
+                            )
+                        )
+                    }
+
+                    // Apply the same global aspect ratio/scaling to the overlay
+                    when (targetAspectRatio) {
+                        "9:16" -> overlayEffects.add(0, Presentation.createForAspectRatio(9f / 16f, Presentation.LAYOUT_SCALE_TO_FIT))
+                        "16:9" -> overlayEffects.add(0, Presentation.createForAspectRatio(16f / 9f, Presentation.LAYOUT_SCALE_TO_FIT))
+                        "1:1" -> overlayEffects.add(0, Presentation.createForAspectRatio(1f, Presentation.LAYOUT_SCALE_TO_FIT))
+                    }
+
+                    val overlayMediaItem = MediaItem.Builder()
+                        .setUri(sourceUriToUse)
+                        .setClippingConfiguration(
+                            MediaItem.ClippingConfiguration.Builder()
+                                .setStartPositionMs(layer.getResolvedStartMs())
+                                .setEndPositionMs(layer.getResolvedEndMs())
+                                .build()
+                        )
+                        .build()
+
+                    val editedOverlayItem = EditedMediaItem.Builder(overlayMediaItem)
+                        .setRemoveAudio(true) // Overlays should not duplicate audio
+                        .setEffects(Effects(emptyList(), overlayEffects))
+                        .build()
+
+                    masterSequenceList.add(EditedMediaItemSequence(editedOverlayItem))
+                }
+            }
         }
 
         // 8. Validate & Inject Replacement TTS Commentary Audio Track
@@ -336,18 +368,16 @@ class Media3TransformerEngine(private val context: Context) {
             true
         }
 
-        val composition = if (isCommentaryAudioValid && commentaryAudioUri != null) {
+        if (isCommentaryAudioValid && commentaryAudioUri != null) {
             val audioMediaItem = MediaItem.fromUri(commentaryAudioUri)
             val editedAudioItem = EditedMediaItem.Builder(audioMediaItem)
                 .setRemoveVideo(true)
                 .build()
-            val audioSequence = EditedMediaItemSequence(editedAudioItem)
-
-            Composition.Builder(listOf(videoSequence, audioSequence)).build()
-        } else {
-            Composition.Builder(listOf(videoSequence)).build()
+            masterSequenceList.add(EditedMediaItemSequence(editedAudioItem))
         }
 
+        // Fire up Composition with all Parallel Sequences
+        val composition = Composition.Builder(masterSequenceList).build()
         runTransformer(composition, outputFile)
     }
 
