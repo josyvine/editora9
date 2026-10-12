@@ -23,13 +23,19 @@ import com.vineyard.aivideostudio.core.model.effects.TrackingStyle
 data class MasterRecipe(
     @Json(name = "projectInfo") val projectInfo: ProjectInfoDto? = null,
     @Json(name = "audioOnlyMode") val audioOnlyMode: Boolean = false, // When true: untouched original video frames
+    @Json(name = "keepOriginalAudio") val keepOriginalAudio: Boolean? = null, // Optional: preserve camera mic sound (e.g. clap, snap)
+    @Json(name = "keep_original_audio") val keepOriginalAudioSnake: Boolean? = null, // snake_case support from AI Studio
     @Json(name = "editingPlan") val editingPlan: EditingPlanDto,
     @Json(name = "captions") val captions: List<RecipeCaptionDto> = emptyList(),
     @Json(name = "commentary") val commentary: RecipeCommentaryDto,
     @Json(name = "voiceEngine") val voiceEngine: String? = null,       // Root override: "live" or "tts"
     @Json(name = "cueMode") val cueMode: String? = null,               // Root override: "single" or "multiple"
     @Json(name = "cueConcurrency") val cueConcurrency: Int? = null    // Root override: e.g. 10
-)
+) {
+    fun isOriginalAudioPreserved(): Boolean {
+        return keepOriginalAudio ?: keepOriginalAudioSnake ?: false
+    }
+}
 
 @JsonClass(generateAdapter = true)
 data class ProjectInfoDto(
