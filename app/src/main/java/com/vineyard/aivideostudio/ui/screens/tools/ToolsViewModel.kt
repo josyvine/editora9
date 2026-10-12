@@ -185,7 +185,13 @@ data class ToolsUiState(
     // Render Progress State (Tab 3)
     val isRendering: Boolean = false,
     val renderPercent: Int = 0,
-    val renderProgressStatus: String = "Ready"
+    val renderProgressStatus: String = "Ready",
+
+    // Imported Thumbnail / Cover Attachment State
+    val thumbnailUri: Uri? = null,
+    val thumbnailBitmap: Bitmap? = null,
+    val thumbnailTargetIndex: Int = 0,
+    val thumbnailDurationSeconds: Float = 1.0f
 )
 
 class ToolsViewModel(
@@ -217,6 +223,57 @@ class ToolsViewModel(
 
     fun setCueKeyword(keyword: String) {
         _uiState.update { it.copy(cueKeyword = keyword) }
+    }
+
+    // =========================================================
+    // IMPORTED THUMBNAIL / COVER MANAGEMENT
+    // =========================================================
+    fun onThumbnailSelected(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val context = getApplication<Application>()
+                val inputStream = context.contentResolver.openInputStream(uri)
+                val bitmap = BitmapFactory.decodeStream(inputStream)
+                inputStream?.close()
+
+                if (bitmap != null) {
+                    val currentIndex = _uiState.value.currentFrameIndex
+                    // If at the beginning, slot at 0 (intro/cover). Otherwise, slot right before the selected frame.
+                    val targetIndex = if (currentIndex <= 0) 0 else currentIndex
+
+                    withContext(Dispatchers.Main) {
+                        _uiState.update {
+                            it.copy(
+                                thumbnailUri = uri,
+                                thumbnailBitmap = bitmap,
+                                thumbnailTargetIndex = targetIndex
+                            )
+                        }
+                        val posLabel = if (targetIndex == 0) "beginning (Intro Cover)" else "between Fr ${targetIndex - 1} and Fr $targetIndex"
+                        addLog("🖼️ Thumbnail cover attached at $posLabel.", LogType.SUCCESS)
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        addLog("❌ Failed to decode selected image as bitmap.", LogType.ERROR)
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    addLog("❌ Thumbnail selection error: ${e.message}", LogType.ERROR)
+                }
+            }
+        }
+    }
+
+    fun removeThumbnail() {
+        _uiState.update {
+            it.copy(
+                thumbnailUri = null,
+                thumbnailBitmap = null,
+                thumbnailTargetIndex = 0
+            )
+        }
+        addLog("🗑️ Thumbnail cover removed.", LogType.INFO)
     }
 
     // =========================================================
@@ -1695,8 +1752,16 @@ class ToolsViewModel(
                 val allHighlightsMap = state.accumulatedDirectBlurs.toMutableMap()
                 allHighlightsMap.putAll(state.directBlurs)
 
-                // Video duration is strictly bound to original video length (prevents stretching to 5:48)
+                // Video duration is strictly bound to original video length
                 val totalVideoFrames = max(1, if (durationSec > 0f) floor(durationSec * fps).toInt() else state.frames.size)
+
+                // Calculate thumbnail insertion frames and total output frames
+                val thumbBitmap = state.thumbnailBitmap
+                val thumbFrames = if (thumbBitmap != null) max(1, (state.thumbnailDurationSeconds * fps).toInt()) else 0
+                val thumbTargetIndex = state.thumbnailTargetIndex.coerceIn(0, totalVideoFrames)
+                val totalOutputFrames = totalVideoFrames + thumbFrames
+                val thumbDurationUs = if (thumbFrames > 0) (thumbFrames * 1_000_000L) / fps else 0L
+                val thumbInsertionTimeUs = (thumbTargetIndex * 1_000_000L) / fps
 
                 val workspaceDir = File(context.filesDir, "editora_frames_workspace")
                 if (!workspaceDir.exists()) {
@@ -1731,29 +1796,8 @@ class ToolsViewModel(
                 var lastValidFrameBitmap: Bitmap? = null
 
                 // Single fast pass: Render video directly from 0% to 100%
-                for (i in 0 until totalVideoFrames) {
-                    val targetTimeUs = (i * 1_000_000L) / fps
-
-                    // Load frame from workspace cache first, or hardware scaled retriever fallback
-                    val frameFile = File(workspaceDir, "frame_$i.jpg")
-                    val currentBitmap = if (frameFile.exists()) {
-                        BitmapFactory.decodeFile(frameFile.absolutePath)
-                    } else {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && outWidth > 0 && outHeight > 0) {
-                            streamRetriever.getScaledFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, outWidth, outHeight)
-                                ?: streamRetriever.getScaledFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST, outWidth, outHeight)
-                                ?: streamRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                        } else {
-                            streamRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                        }
-                    }
-
-                    if (currentBitmap != null) {
-                        lastValidFrameBitmap?.recycle()
-                        lastValidFrameBitmap = currentBitmap
-                    }
-
-                    val frameBitmap = currentBitmap ?: lastValidFrameBitmap ?: continue
+                for (outFrame in 0 until totalOutputFrames) {
+                    val isThumbnailSlot = thumbBitmap != null && outFrame in thumbTargetIndex until (thumbTargetIndex + thumbFrames)
 
                     val surfaceCanvas: Canvas? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                         inputSurface.lockHardwareCanvas()
@@ -1763,38 +1807,68 @@ class ToolsViewModel(
 
                     if (surfaceCanvas != null) {
                         try {
-                            // Draw base video frame scaled 100% to fill the encoder canvas
-                            surfaceCanvas.drawBitmap(frameBitmap, null, destRect, null)
+                            if (isThumbnailSlot && thumbBitmap != null) {
+                                // Draw user-imported cover/thumbnail image directly onto encoder canvas
+                                surfaceCanvas.drawBitmap(thumbBitmap, null, destRect, null)
+                            } else {
+                                // Map to source video frame index (compensating for thumbnail offset)
+                                val i = if (outFrame >= thumbTargetIndex + thumbFrames) outFrame - thumbFrames else outFrame
+                                val targetTimeUs = (i * 1_000_000L) / fps
 
-                            val boxes = allHighlightsMap[i] ?: emptyList()
-                            for (box in boxes) {
-                                // Dynamic resolution-independent scaling from decoded frame dimensions to encoder canvas
-                                val scaleX = outWidth.toFloat() / frameBitmap.width.toFloat()
-                                val scaleY = outHeight.toFloat() / frameBitmap.height.toFloat()
+                                // Load frame from workspace cache first, or hardware scaled retriever fallback
+                                val frameFile = File(workspaceDir, "frame_$i.jpg")
+                                val currentBitmap = if (frameFile.exists()) {
+                                    BitmapFactory.decodeFile(frameFile.absolutePath)
+                                } else {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && outWidth > 0 && outHeight > 0) {
+                                        streamRetriever.getScaledFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, outWidth, outHeight)
+                                            ?: streamRetriever.getScaledFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST, outWidth, outHeight)
+                                            ?: streamRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                                    } else {
+                                        streamRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                                    }
+                                }
 
-                                val bx = box.x0 * scaleX
-                                val by = box.y0 * scaleY
-                                val bw = box.width * scaleX
-                                val bh = box.height * scaleY
+                                if (currentBitmap != null) {
+                                    lastValidFrameBitmap?.recycle()
+                                    lastValidFrameBitmap = currentBitmap
+                                }
 
-                                NativeOverlayRenderer.drawToolOnAndroidCanvas(
-                                    canvas = surfaceCanvas,
-                                    x0 = bx,
-                                    y0 = by,
-                                    width = bw,
-                                    height = bh,
-                                    toolType = box.tool,
-                                    currentTimeMs = (i * 1000L) / fps,
-                                    withArrow = state.isArrowPointerEnabled
-                                )
+                                val frameBitmap = currentBitmap ?: lastValidFrameBitmap
+                                if (frameBitmap != null) {
+                                    // Draw base video frame scaled 100% to fill the encoder canvas
+                                    surfaceCanvas.drawBitmap(frameBitmap, null, destRect, null)
+
+                                    val boxes = allHighlightsMap[i] ?: emptyList()
+                                    for (box in boxes) {
+                                        val scaleX = outWidth.toFloat() / frameBitmap.width.toFloat()
+                                        val scaleY = outHeight.toFloat() / frameBitmap.height.toFloat()
+
+                                        val bx = box.x0 * scaleX
+                                        val by = box.y0 * scaleY
+                                        val bw = box.width * scaleX
+                                        val bh = box.height * scaleY
+
+                                        NativeOverlayRenderer.drawToolOnAndroidCanvas(
+                                            canvas = surfaceCanvas,
+                                            x0 = bx,
+                                            y0 = by,
+                                            width = bw,
+                                            height = bh,
+                                            toolType = box.tool,
+                                            currentTimeMs = (i * 1000L) / fps,
+                                            withArrow = state.isArrowPointerEnabled
+                                        )
+                                    }
+                                }
+
+                                if (currentBitmap != null && currentBitmap != lastValidFrameBitmap) {
+                                    currentBitmap.recycle()
+                                }
                             }
                         } finally {
                             inputSurface.unlockCanvasAndPost(surfaceCanvas)
                         }
-                    }
-
-                    if (currentBitmap != null && currentBitmap != lastValidFrameBitmap) {
-                        currentBitmap.recycle()
                     }
 
                     // Drain encoder output buffers properly setting synthetic PTS
@@ -1821,12 +1895,12 @@ class ToolsViewModel(
                         }
                     }
 
-                    val pct = (((i + 1).toFloat() / totalVideoFrames.toFloat()) * 100).toInt()
+                    val pct = (((outFrame + 1).toFloat() / totalOutputFrames.toFloat()) * 100).toInt()
                     _uiState.update { it.copy(
                         renderPercent = pct.coerceIn(0, 100),
-                        renderProgressStatus = "Burning frame ${i + 1}/$totalVideoFrames (${allHighlightsMap.size} active highlight frames)..."
+                        renderProgressStatus = "Burning frame ${outFrame + 1}/$totalOutputFrames (${allHighlightsMap.size} active highlight frames)..."
                     )}
-                    updateBackgroundKeepAlive(i + 1, totalVideoFrames)
+                    updateBackgroundKeepAlive(outFrame + 1, totalOutputFrames)
                 }
 
                 // Final EOS drain with synthetic PTS to guarantee exact audio duration synchronization
@@ -1868,9 +1942,15 @@ class ToolsViewModel(
                     videoMuxer = null
                 }
 
-                // 3. Merging Video & Audio with resilient fallback
+                // 3. Merging Video & Audio with resilient fallback (including audio offset for inserted cover)
                 val finalExportFile = if (hasAudio && tempVideoFile.exists() && tempAudioFile.exists() && tempAudioFile.length() > 0L) {
-                    val merged = mergeVideoAndAudio(tempVideoFile, tempAudioFile, tempFinalFile)
+                    val merged = mergeVideoAndAudio(
+                        videoFile = tempVideoFile,
+                        audioFile = tempAudioFile,
+                        outputFile = tempFinalFile,
+                        audioOffsetUs = thumbDurationUs,
+                        audioInsertionThresholdUs = thumbInsertionTimeUs
+                    )
                     if (merged && tempFinalFile.exists() && tempFinalFile.length() > 0L) {
                         tempFinalFile
                     } else {
@@ -1923,7 +2003,13 @@ class ToolsViewModel(
         }
     }
 
-    private fun mergeVideoAndAudio(videoFile: File, audioFile: File, outputFile: File): Boolean {
+    private fun mergeVideoAndAudio(
+        videoFile: File,
+        audioFile: File,
+        outputFile: File,
+        audioOffsetUs: Long = 0L,
+        audioInsertionThresholdUs: Long = 0L
+    ): Boolean {
         var videoExtractor: MediaExtractor? = null
         var audioExtractor: MediaExtractor? = null
         var muxer: MediaMuxer? = null
@@ -1984,7 +2070,12 @@ class ToolsViewModel(
 
             // Interleave video and audio frames monotonically by presentation timestamp
             while (hasVideoSample || hasAudioSample) {
-                if (hasVideoSample && (!hasAudioSample || videoExtractor.sampleTime <= audioExtractor.sampleTime)) {
+                val adjustedAudioTime = if (hasAudioSample) {
+                    val rawAudioTime = audioExtractor.sampleTime
+                    if (audioOffsetUs > 0L && rawAudioTime >= audioInsertionThresholdUs) rawAudioTime + audioOffsetUs else rawAudioTime
+                } else Long.MAX_VALUE
+
+                if (hasVideoSample && (!hasAudioSample || videoExtractor.sampleTime <= adjustedAudioTime)) {
                     val size = videoExtractor.readSampleData(videoBuffer, 0)
                     if (size >= 0) {
                         bufferInfo.offset = 0
@@ -2001,7 +2092,7 @@ class ToolsViewModel(
                     if (size >= 0) {
                         bufferInfo.offset = 0
                         bufferInfo.size = size
-                        bufferInfo.presentationTimeUs = audioExtractor.sampleTime
+                        bufferInfo.presentationTimeUs = adjustedAudioTime
                         bufferInfo.flags = audioExtractor.sampleFlags
                         muxer.writeSampleData(audioTrackIndex, audioBuffer, bufferInfo)
                         hasAudioSample = audioExtractor.advance()
@@ -2157,3 +2248,4 @@ class ToolsViewModel(
         ocrEngine.close()
     }
 }
+
