@@ -886,12 +886,16 @@ class VideoProcessingPipeline(
             LogSeverity.INFO
         )
 
+        // Dynamic audio retention: If script specifies keepOriginalAudio = true, keep original sound.
+        // Otherwise, persist your exact default logic: purge original audio (true) to replace with TTS.
+        val shouldStripOriginalAudio = !recipe.isOriginalAudioPreserved()
+
         val finalOutputFile = storageManager.createFinalOutputFile(projectId)
         val exportResult = transformerEngine.exportVideo(
             inputUri = Uri.parse(currentVideoUri),
             outputFile = finalOutputFile,
             commentaryAudioUri = generatedAudioFile?.let { Uri.fromFile(it) },
-            stripOriginalAudio = true,
+            stripOriginalAudio = shouldStripOriginalAudio,
             captions = remappedCaptions,
             targetAspectRatio = if (recipe.audioOnlyMode) "ORIGINAL" else (recipe.projectInfo?.targetAspectRatio ?: project.targetAspectRatio),
             zoomScale = if (recipe.audioOnlyMode) 1.0f else (recipe.editingPlan.zoom?.scale ?: 1.0f),
