@@ -515,7 +515,8 @@ class VideoProcessingPipeline(
             targetAspectRatio = project.targetAspectRatio,
             zoomScale = if (zoomDecision.isNecessary) zoomDecision.toScale else 1.0f,
             videoWidth = project.metadata.width,
-            videoHeight = project.metadata.height
+            videoHeight = project.metadata.height,
+            overlaySourceUri = Uri.parse(project.sourceUri ?: currentVideoUri)
         )
 
         val finalVideoUri = when (exportResult) {
@@ -907,7 +908,8 @@ class VideoProcessingPipeline(
             textCards = remappedTextCards,
             compositeLayers = compositeLayerDtos,
             videoWidth = project.metadata.width,
-            videoHeight = project.metadata.height
+            videoHeight = project.metadata.height,
+            overlaySourceUri = Uri.parse(project.sourceUri ?: currentVideoUri)
         )
 
         val finalVideoUri = when (exportResult) {
