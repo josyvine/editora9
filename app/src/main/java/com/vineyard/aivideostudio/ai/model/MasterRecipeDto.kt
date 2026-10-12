@@ -49,7 +49,43 @@ data class EditingPlanDto(
     @Json(name = "replacementOverlays") val replacementOverlays: List<RecipeReplacementDto> = emptyList(),
     @Json(name = "colorGrade") val colorGrade: RecipeColorGradeDto? = null,
     @Json(name = "trackingIndicators") val trackingIndicators: List<RecipeTrackingDto> = emptyList(),
-    @Json(name = "textCards") val textCards: List<RecipeTextCardDto> = emptyList() // Intro slates, instruction cards & outro summaries
+    @Json(name = "textCards") val textCards: List<RecipeTextCardDto> = emptyList(), // Intro slates, instruction cards & outro summaries
+    @Json(name = "compositeLayers") val compositeLayers: List<RecipeCompositeLayerDto> = emptyList(),
+    @Json(name = "composite_layers") val compositeLayersSnake: List<RecipeCompositeLayerDto>? = null
+) {
+    fun getResolvedCompositeLayers(): List<RecipeCompositeLayerDto> {
+        return if (compositeLayers.isNotEmpty()) compositeLayers else (compositeLayersSnake ?: emptyList())
+    }
+}
+
+@JsonClass(generateAdapter = true)
+data class RecipeCompositeLayerDto(
+    @Json(name = "id") val id: String? = null,
+    @Json(name = "start_time_ms") val startTimeMs: Long = 0L,
+    @Json(name = "end_time_ms") val endTimeMs: Long = 0L,
+    @Json(name = "start_sec") val startSec: Double? = null,
+    @Json(name = "end_sec") val endSec: Double? = null,
+    @Json(name = "playback_rate") val playbackRate: Float = 1.0f, // 1.0 = normal, -1.0 = reverse (Spider-Man trick)
+    @Json(name = "layer_order") val layerOrder: Int = 1,          // 0 = base, 1 = overlay
+    @Json(name = "mask") val mask: RecipeCompositeMaskDto? = null
+) {
+    fun getResolvedStartMs(): Long {
+        return if (startTimeMs > 0L) startTimeMs else ((startSec ?: 0.0) * 1000.0).toLong()
+    }
+
+    fun getResolvedEndMs(): Long {
+        return if (endTimeMs > 0L) endTimeMs else ((endSec ?: 0.0) * 1000.0).toLong()
+    }
+}
+
+@JsonClass(generateAdapter = true)
+data class RecipeCompositeMaskDto(
+    @Json(name = "shape") val shape: String = "linear_horizontal", // "linear_horizontal", "linear_vertical", "rectangle", "radial_circle"
+    @Json(name = "start_split_pos") val startSplitPos: Float = 0.5f,
+    @Json(name = "end_split_pos") val endSplitPos: Float = 0.5f,
+    @Json(name = "feather_radius") val featherRadius: Float = 0.04f,
+    @Json(name = "is_inverted") val isInverted: Boolean = false,
+    @Json(name = "bounds") val bounds: NormalizedBoundsDto? = null
 )
 
 @JsonClass(generateAdapter = true)
