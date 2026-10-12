@@ -29,6 +29,7 @@ import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.Transformer
 import com.google.common.collect.ImmutableList
 import com.vineyard.aivideostudio.ai.model.HighlightSegment
+import com.vineyard.aivideostudio.ai.model.RecipeCompositeLayerDto
 import com.vineyard.aivideostudio.core.model.Caption
 import com.vineyard.aivideostudio.core.model.effects.BlurSpec
 import com.vineyard.aivideostudio.core.model.effects.ColorGradeSpec
@@ -40,6 +41,7 @@ import com.vineyard.aivideostudio.core.result.AppError
 import com.vineyard.aivideostudio.core.result.AppResult
 import com.vineyard.aivideostudio.media.transformer.effects.BlurGlEffect
 import com.vineyard.aivideostudio.media.transformer.effects.ColorFilterGlEffect
+import com.vineyard.aivideostudio.media.transformer.effects.CompositeMaskGlEffect
 import com.vineyard.aivideostudio.media.transformer.overlays.DynamicGraphicsOverlay
 import com.vineyard.aivideostudio.media.transformer.overlays.TextCardOverlay
 import kotlinx.coroutines.Dispatchers
@@ -186,6 +188,7 @@ class Media3TransformerEngine(private val context: Context) {
      * 2. Muxes synthesized TTS audio track as the sole soundtrack.
      * 3. Applies hardware-accelerated Speed Ramping, GPU Shaders, and dynamic Canvas Overlays.
      * 4. Renders Presentation Text Cards (Instruction & Conclusion Slates).
+     * 5. Applies hardware CompositeMaskGlEffect when compositeLayers are present in recipe.
      */
     suspend fun exportVideo(
         inputUri: Uri,
@@ -201,6 +204,7 @@ class Media3TransformerEngine(private val context: Context) {
         colorGrade: ColorGradeSpec? = null,
         trackingIndicators: List<TrackingIndicatorSpec> = emptyList(),
         textCards: List<TextCardSpec> = emptyList(),
+        compositeLayers: List<RecipeCompositeLayerDto> = emptyList(),
         videoWidth: Int? = null,
         videoHeight: Int? = null
     ): AppResult<File> = withContext(Dispatchers.Main) {
@@ -243,7 +247,46 @@ class Media3TransformerEngine(private val context: Context) {
             sharedVideoEffects.add(ColorFilterGlEffect(colorGrade))
         }
 
-        // 5. Overlays (Captions, Dynamic Graphics & Presentation Text Cards)
+        // 5. Dynamic Composite Mask Shader (Stunts, Clones, Traveling Mattes, Wipes)
+        if (compositeLayers.isNotEmpty()) {
+            for (layer in compositeLayers) {
+                val maskDto = layer.mask
+                if (maskDto != null) {
+                    val resolvedMaskType = when (maskDto.shape.lowercase()) {
+                        "linear_vertical" -> CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
+                        "rectangle" -> CompositeMaskGlEffect.MaskType.RECTANGLE
+                        "radial_circle" -> CompositeMaskGlEffect.MaskType.RADIAL_CIRCLE
+                        else -> CompositeMaskGlEffect.MaskType.LINEAR_HORIZONTAL
+                    }
+
+                    val boundsArray = if (maskDto.bounds != null) {
+                        floatArrayOf(
+                            maskDto.bounds.left.coerceIn(0.0f, 1.0f),
+                            maskDto.bounds.top.coerceIn(0.0f, 1.0f),
+                            maskDto.bounds.right.coerceIn(0.0f, 1.0f),
+                            maskDto.bounds.bottom.coerceIn(0.0f, 1.0f)
+                        )
+                    } else {
+                        floatArrayOf(0f, 0f, 1f, 1f)
+                    }
+
+                    sharedVideoEffects.add(
+                        CompositeMaskGlEffect(
+                            maskType = resolvedMaskType,
+                            startSplitPos = maskDto.startSplitPos.coerceIn(0.0f, 1.0f),
+                            endSplitPos = maskDto.endSplitPos.coerceIn(0.0f, 1.0f),
+                            feather = maskDto.featherRadius.coerceIn(0.0001f, 0.5f),
+                            isInverted = maskDto.isInverted,
+                            rectBounds = boundsArray,
+                            startTimeUs = layer.getResolvedStartMs() * 1000L,
+                            endTimeUs = if (layer.getResolvedEndMs() > 0L) layer.getResolvedEndMs() * 1000L else Long.MAX_VALUE
+                        )
+                    )
+                }
+            }
+        }
+
+        // 6. Overlays (Captions, Dynamic Graphics & Presentation Text Cards)
         val overlayList = mutableListOf<TextureOverlay>()
 
         if (captions.isNotEmpty()) {
@@ -272,7 +315,7 @@ class Media3TransformerEngine(private val context: Context) {
         // Strict audio enforcement: If replacement commentary is provided, force strip original audio
         val shouldStripAudio = stripOriginalAudio || (commentaryAudioUri != null)
 
-        // 6. Build Video Sequence
+        // 7. Build Video Sequence
         val videoSequence = if (speedRamps.isNotEmpty()) {
             buildSpeedRampedSequence(inputUri, shouldStripAudio, speedRamps, sharedVideoEffects)
         } else {
@@ -284,7 +327,7 @@ class Media3TransformerEngine(private val context: Context) {
             EditedMediaItemSequence(editedVideoItem)
         }
 
-        // 7. Validate & Inject Replacement TTS Commentary Audio Track
+        // 8. Validate & Inject Replacement TTS Commentary Audio Track
         val isCommentaryAudioValid = commentaryAudioUri != null && try {
             val path = commentaryAudioUri.path ?: ""
             val f = File(path)
