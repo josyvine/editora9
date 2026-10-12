@@ -586,10 +586,13 @@ class VideoProcessingPipeline(
         val trackingSpecs = recipe.editingPlan.trackingIndicators.mapIndexed { idx, dto -> dto.toTrackingIndicatorSpec(idx) }
         val cardSpecs = recipe.editingPlan.textCards.mapIndexed { idx, dto -> dto.toTextCardSpec(idx) }
 
+        // Extract Composite Layers from Recipe (Clones, Traveling Mattes, Stunts)
+        val compositeLayerDtos = recipe.editingPlan.getResolvedCompositeLayers()
+
         logger.log(
             projectId,
             PipelineStatus.SOURCE_ANALYSIS,
-            "Master Recipe Configuration: AudioOnly=${recipe.audioOnlyMode} | SpeedRamps=${speedSpecs.size} | Blurs=${blurSpecs.size} | Highlights=${trackingSpecs.size} | Overlays=${replacementSpecs.size} | Cards=${cardSpecs.size} | ColorGrade=${colorGradeSpec?.preset ?: "None"}",
+            "Master Recipe Configuration: AudioOnly=${recipe.audioOnlyMode} | SpeedRamps=${speedSpecs.size} | Blurs=${blurSpecs.size} | Highlights=${trackingSpecs.size} | Overlays=${replacementSpecs.size} | Cards=${cardSpecs.size} | CompositeLayers=${compositeLayerDtos.size} | ColorGrade=${colorGradeSpec?.preset ?: "None"}",
             LogSeverity.INFO
         )
 
@@ -879,7 +882,7 @@ class VideoProcessingPipeline(
         logger.log(
             projectId,
             PipelineStatus.EXPORTING,
-            "Starting Media3 Hardware Export: Slices=${speedSpecs.size + 1} | Highlights=${remappedTrackingIndicators.size} | Overlays=${remappedReplacementOverlays.size} | Cards=${remappedTextCards.size} | Blurs=${remappedBlurSpecs.size} | PurgeSourceAudio=true",
+            "Starting Media3 Hardware Export: Slices=${speedSpecs.size + 1} | Highlights=${remappedTrackingIndicators.size} | Overlays=${remappedReplacementOverlays.size} | Cards=${remappedTextCards.size} | Blurs=${remappedBlurSpecs.size} | CompositeLayers=${compositeLayerDtos.size} | PurgeSourceAudio=true",
             LogSeverity.INFO
         )
 
@@ -898,6 +901,7 @@ class VideoProcessingPipeline(
             colorGrade = colorGradeSpec,
             trackingIndicators = remappedTrackingIndicators,
             textCards = remappedTextCards,
+            compositeLayers = compositeLayerDtos,
             videoWidth = project.metadata.width,
             videoHeight = project.metadata.height
         )
