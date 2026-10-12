@@ -1,0 +1,110 @@
+<resources>
+    <!-- Existing App Navigation & Titles -->
+    <string name="app_name">Editora</string>
+    <string name="app_tagline">AI-Directed Video Production Studio</string>
+    <string name="nav_home">Home</string>
+    <string name="nav_projects">Projects</string>
+    <string name="nav_create">Create</string>
+    <string name="nav_activity">Activity</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- NEW: Tools Navigation (6th Bottom Tab) -->
+    <string name="nav_tools">Tools</string>
+
+    <!-- NEW: Tools Screen - General & Tabs -->
+    <string name="tools_title">Video OCR Studio</string>
+    <string name="tools_tab_viewer">Studio Viewer</string>
+    <string name="tools_tab_export">Export Data</string>
+    <string name="tools_tab_render">Render Video</string>
+    <string name="tools_status_ready">Ready</string>
+
+    <!-- NEW: Tools Screen - Studio Viewer Tab -->
+    <string name="tools_viewer_slot_cycle">Slot Cycle: Play video -> 1st Pause sets start</string>
+    <string name="tools_viewer_reset">Reset</string>
+    <string name="tools_viewer_play">Play</string>
+    <string name="tools_viewer_pause">Pause</string>
+    <string name="tools_viewer_sound_on">🔊 Sound ON</string>
+    <string name="tools_viewer_sound_off">🔇 Sound OFF</string>
+    <string name="tools_viewer_step_back">-1 Frame</string>
+    <string name="tools_viewer_step_forward">+1 Frame</string>
+    <string name="tools_viewer_scan_frame">Scan #%d</string>
+    <string name="tools_viewer_choose_video">Choose Video or Screenshot</string>
+    <string name="tools_viewer_extract_all">Extract All</string>
+    <string name="tools_viewer_frames_title">All Video Frames (%d) - Uncut Original Length</string>
+    <string name="tools_viewer_toggle_hint">Tap toggle to unmark box</string>
+    
+    <!-- NEW: Tools Screen - Target Panel -->
+    <string name="tools_target_placeholder">Target word (e.g. Playground, Dashboard, Email)</string>
+    <string name="tools_target_lock">Lock Target</string>
+    <string name="tools_target_arrow">Arrow Pointer</string>
+    <string name="tools_target_discard">Discard Wrong Highlights</string>
+    <string name="tools_target_empty">No target added yet. Enter word and tap \"Lock Target\".</string>
+
+    <!-- NEW: Target Categories -->
+    <string name="category_global">Category: Global (Anywhere)</string>
+    <string name="category_sidebar">Category: Sidebar Menu</string>
+    <string name="category_header">Category: Top Header Bar</string>
+    <string name="category_settings">Category: Settings Drawer</string>
+
+    <!-- NEW: 10 Editora4 Tools -->
+    <string name="tool_blur_gaussian">Gaussian Optical Blur</string>
+    <string name="tool_blur_mosaic">Pixelated Mosaic Blur</string>
+    <string name="tool_privacy_box">Solid Privacy Box</string>
+    <string name="tool_emoji_pill">Privacy Lock Emoji Pill (🔒)</string>
+    <string name="tool_button_highlight">Button Highlight (Pulsing Brackets)</string>
+    <string name="tool_flashing_arrow">Flashing / Bouncing Arrow</string>
+    <string name="tool_spotlight">Spotlight (Dim Background)</string>
+    <string name="tool_highlight_circle">Highlight Circle / Ring</string>
+    <string name="tool_highlight_box">Standard Highlight Box</string>
+    <string name="tool_vertical_column">Vertical Pillar / Sidebar Frame</string>
+
+    <!-- NEW: Export Data 3-Step Wizard -->
+    <string name="tools_wizard_step1">1. 🤖 Gemini AI</string>
+    <string name="tools_wizard_step2">2. 🔍 Auto-Scan ZIP</string>
+    <string name="tools_wizard_step3">3. 📋 Coordinates</string>
+    
+    <!-- Wizard Step 1: Gemini AI Transcriber -->
+    <string name="tools_gemini_settings">🤖 Google Gemini AI Settings</string>
+    <string name="tools_gemini_fetch">🔄 Fetch Models</string>
+    <string name="tools_gemini_api_hint">Enter Gemini API Key (AIzaSy...)</string>
+    <string name="tools_gemini_transcribe">🎙️ Transcribe Audio with Gemini AI</string>
+    <string name="tools_gemini_download_json">💾 Download JSON</string>
+    <string name="tools_terminal_title">🖥️ Diagnostic Log Console</string>
+    <string name="tools_terminal_copy">📋 Copy</string>
+    <string name="tools_terminal_copied">✅ Copied!</string>
+    <string name="tools_terminal_clear">🗑️ Clear</string>
+    <string name="tools_wizard_next_2">Next: Auto-Scan ZIP Tool ➔</string>
+
+    <!-- Wizard Step 2: Auto-Scan ZIP & Audio Sync -->
+    <string name="tools_autoscan_title">Auto-Scan ZIP &amp; Apply Editora4 Tool</string>
+    <string name="tools_autoscan_target_hint">Text to target on screen (e.g. Playground)</string>
+    <string name="tools_autoscan_audio_sync">🎙️ Audio Cue Sync (Spoken Intent Trigger)</string>
+    <string name="tools_autoscan_audio_file">+ Optional File (SRT/VTT/JSON)</string>
+    <string name="tools_autoscan_audio_hint">Filter spoken words (e.g. \'click on\') or direct timestamps</string>
+    <string name="tools_autoscan_find_cues">Find Cues</string>
+    <string name="tools_autoscan_fetch_zip">Fetch ZIP &amp; Apply Tool</string>
+    <string name="tools_autoscan_pick_zip">Or Pick ZIP from Device</string>
+    <string name="tools_wizard_back_1">⬅ Back: Gemini AI</string>
+    <string name="tools_wizard_next_3">Next: JSON &amp; Export ➔</string>
+
+    <!-- Wizard Step 3: Coordinates & Export -->
+    <string name="tools_export_json_title">Active Highlight Coordinates (JSON)</string>
+    <string name="tools_export_apply">Apply JSON to Video</string>
+    <string name="tools_export_copy">Copy</string>
+    <string name="tools_export_download">Download</string>
+    <string name="tools_export_zip_title">Export All Frames as ZIP</string>
+    <string name="tools_export_download_zip">Download All as ZIP (fr1.timeline.txt, ...)</string>
+    <string name="tools_wizard_back_2">⬅ Back: Auto-Scan ZIP</string>
+
+    <!-- NEW: Tools Screen - Render Video Tab -->
+    <string name="tools_render_title">Render and Export Full Video</string>
+    <string name="tools_render_desc">Burns all selected Editora4 effects (blur, mosaic, boxes, arrows) directly into your exported video with full synchronized original audio at exact normal speed.</string>
+    <string name="tools_render_btn">Download Full Video With Highlights &amp; Audio</string>
+    <string name="tools_render_in_progress">Rendering in Progress...</string>
+
+    <!-- NEW: Tools Screen - Capture Modal -->
+    <string name="tools_modal_title">Target Slot Captured</string>
+    <string name="tools_modal_engine_info">Ultra-Fast Engine: 50 frames concurrently</string>
+    <string name="tools_modal_scan">Ultra-Fast Scan Slot (50 at a time)</string>
+    <string name="tools_modal_discard">Close and Continue Playback</string>
+</resources>
