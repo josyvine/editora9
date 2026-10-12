@@ -188,7 +188,6 @@ class Media3TransformerEngine(private val context: Context) {
      * 2. Muxes synthesized TTS audio track as the sole soundtrack.
      * 3. Applies hardware-accelerated Speed Ramping, GPU Shaders, and dynamic Canvas Overlays.
      * 4. Renders Presentation Text Cards (Instruction & Conclusion Slates).
-     * 5. Runs Multi-Sequence Parallel decoding if compositeLayers are provided.
      */
     suspend fun exportVideo(
         inputUri: Uri,
@@ -350,7 +349,7 @@ class Media3TransformerEngine(private val context: Context) {
                         .build()
 
                     val editedOverlayItem = EditedMediaItem.Builder(overlayMediaItem)
-                        .setRemoveAudio(true) // Overlays should not duplicate audio
+                        .setRemoveAudio(shouldStripAudio) // Keep original audio behavior synced
                         .setEffects(Effects(emptyList(), overlayEffects))
                         .build()
 
