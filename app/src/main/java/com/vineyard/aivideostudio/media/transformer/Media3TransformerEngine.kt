@@ -9,9 +9,12 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.util.Size
 import androidx.annotation.OptIn
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
+import androidx.media3.common.OverlaySettings
+import androidx.media3.common.VideoCompositorSettings
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.BitmapOverlay
 import androidx.media3.effect.Crop
@@ -19,6 +22,7 @@ import androidx.media3.effect.OverlayEffect
 import androidx.media3.effect.Presentation
 import androidx.media3.effect.ScaleAndRotateTransformation
 import androidx.media3.effect.SpeedChangeEffect
+import androidx.media3.effect.StaticOverlaySettings
 import androidx.media3.effect.TextureOverlay
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
@@ -279,9 +283,8 @@ class Media3TransformerEngine(private val context: Context) {
 
         val masterSequenceList = mutableListOf<EditedMediaItemSequence>()
 
-        // 6. Build the Base Video Sequence (Track 1)
+        // 6. Build the Base Video Sequence (Track 1: Right Clone)
         val baseSequence = if (compositeLayers.isNotEmpty()) {
-            // CLONE MODE: Clip Track 1 to match the full take duration
             val baseLayer = compositeLayers.firstOrNull { it.layerOrder == 0 }
             val firstOverlayLayer = compositeLayers.firstOrNull { it.layerOrder > 0 } ?: compositeLayers.first()
             val overlayDuration = firstOverlayLayer.getResolvedEndMs() - firstOverlayLayer.getResolvedStartMs()
@@ -309,7 +312,6 @@ class Media3TransformerEngine(private val context: Context) {
         } else if (speedRamps.isNotEmpty()) {
             buildSpeedRampedSequence(inputUri, shouldStripAudio, speedRamps, sharedVideoEffects)
         } else {
-            // Standard single sequence (Non-clone)
             val videoMediaItem = MediaItem.fromUri(inputUri)
             val editedVideoItem = EditedMediaItem.Builder(videoMediaItem)
                 .setRemoveAudio(shouldStripAudio)
@@ -319,7 +321,7 @@ class Media3TransformerEngine(private val context: Context) {
         }
         masterSequenceList.add(baseSequence)
 
-        // 7. Add Parallel Overlay Video Sequences if Composite Layers exist (Track 2+)
+        // 7. Add Parallel Overlay Video Sequences if Composite Layers exist (Track 2+: Left Clone)
         if (compositeLayers.isNotEmpty()) {
             val sourceUriToUse = overlaySourceUri ?: inputUri
             val isPreTrimmed = overlaySourceUri != null
@@ -356,19 +358,19 @@ class Media3TransformerEngine(private val context: Context) {
                                 feather = maskDto.featherRadius.coerceIn(0.0001f, 0.5f),
                                 isInverted = maskDto.isInverted,
                                 rectBounds = boundsArray,
-                                startTimeUs = 0L, // Aligns overlay start to t=0 of sequence
+                                startTimeUs = 0L,
                                 endTimeUs = Long.MAX_VALUE
                             )
                         )
                     } else {
-                        // Default vertical split mask for clone overlay (splits screen at 48% with feather)
+                        // Default vertical split mask for clone overlay: isInverted = true ensures the Left Clone is visible
                         overlayEffects.add(
                             CompositeMaskGlEffect(
                                 maskType = CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL,
                                 startSplitPos = 0.48f,
                                 endSplitPos = 0.48f,
                                 feather = 0.03f,
-                                isInverted = false,
+                                isInverted = true,
                                 rectBounds = floatArrayOf(0f, 0f, 1f, 1f),
                                 startTimeUs = 0L,
                                 endTimeUs = Long.MAX_VALUE
@@ -395,7 +397,6 @@ class Media3TransformerEngine(private val context: Context) {
                         overlayEffects.add(ColorFilterGlEffect(colorGrade))
                     }
 
-                    // When pre-trimmed, start from byte 0 directly without seeking (prevents decoder deadlock)
                     val overlayMediaItem = if (isPreTrimmed) {
                         MediaItem.fromUri(sourceUriToUse)
                     } else {
@@ -437,8 +438,23 @@ class Media3TransformerEngine(private val context: Context) {
             masterSequenceList.add(EditedMediaItemSequence(editedAudioItem))
         }
 
-        // Fire up Composition with all Parallel Sequences
-        val composition = Composition.Builder(masterSequenceList).build()
+        // 9. Build Multi-Track Composition WITH VideoCompositorSettings
+        val compositionBuilder = Composition.Builder(masterSequenceList)
+
+        // CRITICAL FIX: Instructs Media3 GPU Compositor to merge both video tracks into the final frame
+        if (compositeLayers.isNotEmpty()) {
+            compositionBuilder.setVideoCompositorSettings(object : VideoCompositorSettings {
+                override fun getOutputSize(inputSizes: List<Size>): Size {
+                    return inputSizes.firstOrNull() ?: Size(resolvedWidth, resolvedHeight)
+                }
+
+                override fun getOverlaySettings(inputId: Int, presentationTimeUs: Long): OverlaySettings {
+                    return StaticOverlaySettings.Builder().build()
+                }
+            })
+        }
+
+        val composition = compositionBuilder.build()
         runTransformer(composition, outputFile)
     }
 
