@@ -133,6 +133,9 @@ dependencies {
   implementation("com.google.mlkit:face-detection:16.1.7")
   implementation("com.google.mlkit:object-detection:17.0.2")
 
+  // Google ML Kit On-Device Subject Segmentation (CapCut-Style Auto Background Removal / Cutout)
+  implementation("com.google.android.gms:play-services-mlkit-subject-segmentation:16.0.0-beta1")
+
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
   testImplementation(libs.androidx.junit)
