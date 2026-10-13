@@ -5,6 +5,9 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.media.MediaMetadataRetriever
@@ -41,7 +44,6 @@ import com.vineyard.aivideostudio.core.result.AppError
 import com.vineyard.aivideostudio.core.result.AppResult
 import com.vineyard.aivideostudio.media.transformer.effects.BlurGlEffect
 import com.vineyard.aivideostudio.media.transformer.effects.ColorFilterGlEffect
-import com.vineyard.aivideostudio.media.transformer.effects.CompositeMaskGlEffect
 import com.vineyard.aivideostudio.media.transformer.overlays.DynamicGraphicsOverlay
 import com.vineyard.aivideostudio.media.transformer.overlays.TextCardOverlay
 import kotlinx.coroutines.Dispatchers
@@ -53,9 +55,6 @@ import kotlin.coroutines.resume
 @OptIn(UnstableApi::class)
 class Media3TransformerEngine(private val context: Context) {
 
-    /**
-     * Clips video boundaries (dead-air removal / pacing cuts).
-     */
     suspend fun trimVideo(
         inputUri: Uri,
         outputFile: File,
@@ -83,9 +82,6 @@ class Media3TransformerEngine(private val context: Context) {
         runTransformer(editedMediaItem, outputFile)
     }
 
-    /**
-     * Stitches multiple highlight clips across the video timeline into one continuous highlight montage.
-     */
     suspend fun spliceHighlightSegments(
         inputUri: Uri,
         outputFile: File,
@@ -124,9 +120,6 @@ class Media3TransformerEngine(private val context: Context) {
         runTransformer(composition, outputFile)
     }
 
-    /**
-     * Crops and reframes video using normalized coordinates.
-     */
     suspend fun cropVideo(
         inputUri: Uri,
         outputFile: File,
@@ -156,9 +149,6 @@ class Media3TransformerEngine(private val context: Context) {
         runTransformer(editedMediaItem, outputFile)
     }
 
-    /**
-     * Applies punch-in zoom scaling to the video frames.
-     */
     suspend fun zoomVideo(
         inputUri: Uri,
         outputFile: File,
@@ -182,14 +172,6 @@ class Media3TransformerEngine(private val context: Context) {
         runTransformer(editedMediaItem, outputFile)
     }
 
-    /**
-     * Comprehensive production export pass:
-     * 1. Purges original copyrighted audio track from all video segments (or preserves natural room sound if keepOriginalAudio = true).
-     * 2. Muxes synthesized TTS audio track as designated.
-     * 3. Applies hardware-accelerated Speed Ramping, GPU Shaders, and dynamic Canvas Overlays.
-     * 4. Renders Presentation Text Cards (Instruction & Conclusion Slates).
-     * 5. Multi-track parallel composition with CapCut-style AI Subject Cutouts (Auto Removal).
-     */
     suspend fun exportVideo(
         inputUri: Uri,
         outputFile: File,
@@ -213,7 +195,6 @@ class Media3TransformerEngine(private val context: Context) {
         outputFile.parentFile?.mkdirs()
         if (outputFile.exists()) outputFile.delete()
 
-        // Resolve exact video resolution dynamically (prevents aspect ratio stretching)
         val (resolvedWidth, resolvedHeight) = if (videoWidth != null && videoHeight != null && videoWidth > 0 && videoHeight > 0) {
             Pair(videoWidth, videoHeight)
         } else {
@@ -222,7 +203,6 @@ class Media3TransformerEngine(private val context: Context) {
 
         val sharedVideoEffects = mutableListOf<Effect>()
 
-        // 1. Aspect Ratio Presentation Effect
         when (targetAspectRatio) {
             "9:16" -> sharedVideoEffects.add(Presentation.createForAspectRatio(9f / 16f, Presentation.LAYOUT_SCALE_TO_FIT))
             "16:9" -> sharedVideoEffects.add(Presentation.createForAspectRatio(16f / 9f, Presentation.LAYOUT_SCALE_TO_FIT))
@@ -230,7 +210,6 @@ class Media3TransformerEngine(private val context: Context) {
             else -> {}
         }
 
-        // 2. Zoom Punch-In Effect
         if (zoomScale > 1.0f) {
             sharedVideoEffects.add(
                 ScaleAndRotateTransformation.Builder()
@@ -239,18 +218,40 @@ class Media3TransformerEngine(private val context: Context) {
             )
         }
 
-        // 3. Selective Gaussian / Mosaic Blur Shader
         if (blurSpecs.isNotEmpty()) {
             sharedVideoEffects.add(BlurGlEffect(blurSpecs))
         }
 
-        // 4. Color Grading Shader
         if (colorGrade != null) {
             sharedVideoEffects.add(ColorFilterGlEffect(colorGrade))
         }
 
-        // 5. Overlays (Captions, Dynamic Graphics & Presentation Text Cards)
         val overlayList = mutableListOf<TextureOverlay>()
+
+        // 1. CLONE OVERLAY: Bakes Take 2 (Left Clone) directly into the video frames
+        if (compositeLayers.isNotEmpty() && overlaySourceUri != null) {
+            val overlayFile = runCatching {
+                if (overlaySourceUri.scheme == "file") File(overlaySourceUri.path ?: "") else File(overlaySourceUri.path ?: "")
+            }.getOrNull()
+
+            if (overlayFile != null && overlayFile.exists()) {
+                val overlayLayer = compositeLayers.firstOrNull { it.layerOrder > 0 } ?: compositeLayers.first()
+                val isAiCutout = maskBitmapProvider != null ||
+                        overlayLayer.mask?.shape.equals("ai_subject_cutout", ignoreCase = true) ||
+                        overlayLayer.mask?.shape.equals("auto_removal", ignoreCase = true)
+
+                overlayList.add(
+                    CloneVideoBitmapOverlay(
+                        overlayVideoFile = overlayFile,
+                        maskBitmapProvider = maskBitmapProvider,
+                        splitX = overlayLayer.mask?.startSplitPos ?: 0.48f,
+                        isCutout = isAiCutout,
+                        targetWidth = resolvedWidth,
+                        targetHeight = resolvedHeight
+                    )
+                )
+            }
+        }
 
         if (captions.isNotEmpty()) {
             overlayList.add(SubtitleBitmapOverlay(captions, resolvedWidth, resolvedHeight))
@@ -275,12 +276,10 @@ class Media3TransformerEngine(private val context: Context) {
             sharedVideoEffects.add(OverlayEffect(ImmutableList.copyOf(overlayList)))
         }
 
-        // Strictly honor stripOriginalAudio: when false (keepOriginalAudio = true), retain room sound
         val shouldStripAudio = stripOriginalAudio
-
         val masterSequenceList = mutableListOf<EditedMediaItemSequence>()
 
-        // 6. Build the Base Video Sequence (Track 1: Right Clone)
+        // 2. Build Master Video Sequence (Single video stream with overlays baked into the pixels)
         val baseSequence = if (compositeLayers.isNotEmpty()) {
             val baseLayer = compositeLayers.firstOrNull { it.layerOrder == 0 }
             val firstOverlayLayer = compositeLayers.firstOrNull { it.layerOrder > 0 } ?: compositeLayers.first()
@@ -318,102 +317,7 @@ class Media3TransformerEngine(private val context: Context) {
         }
         masterSequenceList.add(baseSequence)
 
-        // 7. Add Parallel Overlay Video Sequences if Composite Layers exist (Track 2+: Left Clone Cutout)
-        if (compositeLayers.isNotEmpty()) {
-            val sourceUriToUse = overlaySourceUri ?: inputUri
-            val isPreTrimmed = overlaySourceUri != null
-
-            for (layer in compositeLayers) {
-                if (layer.layerOrder > 0) {
-                    val overlayEffects = mutableListOf<Effect>()
-                    val maskDto = layer.mask
-
-                    val boundsArray = if (maskDto?.bounds != null) {
-                        floatArrayOf(
-                            maskDto.bounds.left.coerceIn(0.0f, 1.0f),
-                            maskDto.bounds.top.coerceIn(0.0f, 1.0f),
-                            maskDto.bounds.right.coerceIn(0.0f, 1.0f),
-                            maskDto.bounds.bottom.coerceIn(0.0f, 1.0f)
-                        )
-                    } else {
-                        floatArrayOf(0f, 0f, 1f, 1f)
-                    }
-
-                    // Determine whether AI Subject Cutout or a Geometric Mask is requested
-                    val isAiCutout = maskBitmapProvider != null ||
-                            maskDto?.shape.equals("ai_subject_cutout", ignoreCase = true) ||
-                            maskDto?.shape.equals("auto_removal", ignoreCase = true)
-
-                    val resolvedMaskType = if (isAiCutout) {
-                        CompositeMaskGlEffect.MaskType.AI_SUBJECT_MATTE
-                    } else if (maskDto != null) {
-                        when (maskDto.shape.lowercase()) {
-                            "linear_vertical", "vertical" -> CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
-                            "rectangle" -> CompositeMaskGlEffect.MaskType.RECTANGLE
-                            "radial_circle", "circle" -> CompositeMaskGlEffect.MaskType.RADIAL_CIRCLE
-                            else -> CompositeMaskGlEffect.MaskType.LINEAR_HORIZONTAL
-                        }
-                    } else {
-                        CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
-                    }
-
-                    overlayEffects.add(
-                        CompositeMaskGlEffect(
-                            maskType = resolvedMaskType,
-                            startSplitPos = maskDto?.startSplitPos ?: 0.48f,
-                            endSplitPos = maskDto?.endSplitPos ?: 0.48f,
-                            feather = maskDto?.featherRadius ?: 0.03f,
-                            isInverted = maskDto?.isInverted ?: false,
-                            rectBounds = boundsArray,
-                            startTimeUs = 0L,
-                            endTimeUs = Long.MAX_VALUE,
-                            maskBitmapProvider = maskBitmapProvider
-                        )
-                    )
-
-                    when (targetAspectRatio) {
-                        "9:16" -> overlayEffects.add(0, Presentation.createForAspectRatio(9f / 16f, Presentation.LAYOUT_SCALE_TO_FIT))
-                        "16:9" -> overlayEffects.add(0, Presentation.createForAspectRatio(16f / 9f, Presentation.LAYOUT_SCALE_TO_FIT))
-                        "1:1" -> overlayEffects.add(0, Presentation.createForAspectRatio(1f, Presentation.LAYOUT_SCALE_TO_FIT))
-                    }
-
-                    if (zoomScale > 1.0f) {
-                        overlayEffects.add(
-                            ScaleAndRotateTransformation.Builder()
-                                .setScale(zoomScale, zoomScale)
-                                .build()
-                        )
-                    }
-
-                    if (colorGrade != null) {
-                        overlayEffects.add(ColorFilterGlEffect(colorGrade))
-                    }
-
-                    val overlayMediaItem = if (isPreTrimmed) {
-                        MediaItem.fromUri(sourceUriToUse)
-                    } else {
-                        MediaItem.Builder()
-                            .setUri(sourceUriToUse)
-                            .setClippingConfiguration(
-                                MediaItem.ClippingConfiguration.Builder()
-                                    .setStartPositionMs(layer.getResolvedStartMs())
-                                    .setEndPositionMs(layer.getResolvedEndMs())
-                                    .build()
-                            )
-                            .build()
-                    }
-
-                    val editedOverlayItem = EditedMediaItem.Builder(overlayMediaItem)
-                        .setRemoveAudio(true) // Prevent duplicate echo/room-noise phase clash
-                        .setEffects(Effects(emptyList(), overlayEffects))
-                        .build()
-
-                    masterSequenceList.add(EditedMediaItemSequence(editedOverlayItem))
-                }
-            }
-        }
-
-        // 8. Validate & Inject Replacement TTS Commentary Audio Track
+        // 3. Audio Track
         val isCommentaryAudioValid = commentaryAudioUri != null && try {
             val path = commentaryAudioUri.path ?: ""
             val f = File(path)
@@ -430,15 +334,11 @@ class Media3TransformerEngine(private val context: Context) {
             masterSequenceList.add(EditedMediaItemSequence(editedAudioItem))
         }
 
-        // Standard Media3 Composition (Clean build without unsupported APIs)
+        // Single Unified Stream (100% visible in VLC, Gallery, and all media players)
         val composition = Composition.Builder(masterSequenceList).build()
         runTransformer(composition, outputFile)
     }
 
-    /**
-     * Slices the video into contiguous intervals across the timeline,
-     * applying Media3 SpeedChangeEffect on accelerated sections.
-     */
     private fun buildSpeedRampedSequence(
         inputUri: Uri,
         stripAudio: Boolean,
@@ -454,13 +354,11 @@ class Media3TransformerEngine(private val context: Context) {
             val rampStart = ramp.startTimeMs.coerceIn(0L, totalDurationMs)
             val rampEnd = ramp.endTimeMs.coerceIn(rampStart, totalDurationMs)
 
-            // Add normal speed interval (1.0x) prior to ramp
             if (rampStart > cursorMs) {
                 val normalItem = createSegmentItem(inputUri, cursorMs, rampStart, 1.0f, stripAudio, sharedEffects)
                 editedItems.add(normalItem)
             }
 
-            // Add accelerated interval
             if (rampEnd > rampStart) {
                 val fastItem = createSegmentItem(inputUri, rampStart, rampEnd, ramp.speedMultiplier, stripAudio, sharedEffects)
                 editedItems.add(fastItem)
@@ -469,7 +367,6 @@ class Media3TransformerEngine(private val context: Context) {
             cursorMs = rampEnd
         }
 
-        // Add trailing normal speed interval
         if (cursorMs < totalDurationMs) {
             val trailingItem = createSegmentItem(inputUri, cursorMs, totalDurationMs, 1.0f, stripAudio, sharedEffects)
             editedItems.add(trailingItem)
@@ -524,7 +421,6 @@ class Media3TransformerEngine(private val context: Context) {
             val rawWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1080
             val rawHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1920
 
-            // If video is rotated 90 or 270 degrees, swap width and height
             if (rotation == 90 || rotation == 270) {
                 Pair(rawHeight, rawWidth)
             } else {
@@ -632,9 +528,64 @@ class Media3TransformerEngine(private val context: Context) {
     }
 
     /**
-     * Dynamic BitmapOverlay that renders synchronized multiline subtitles while seamlessly concealing
-     * original hardcoded subtitles located in the lower-third zone.
+     * Renders the secondary clone take directly into the frame buffer as an OpenGL overlay.
+     * Guarantees that both clones are 100% visible in a single video stream in all media players.
      */
+    private class CloneVideoBitmapOverlay(
+        private val overlayVideoFile: File,
+        private val maskBitmapProvider: ((Long) -> Bitmap?)? = null,
+        private val splitX: Float = 0.48f,
+        private val isCutout: Boolean = false,
+        private val targetWidth: Int = 1080,
+        private val targetHeight: Int = 1920
+    ) : BitmapOverlay() {
+
+        private val retriever = MediaMetadataRetriever().apply {
+            setDataSource(overlayVideoFile.absolutePath)
+        }
+
+        private val outputBitmap: Bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+        private val canvas: Canvas = Canvas(outputBitmap)
+        private val paint: Paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val maskPaint: Paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
+        }
+
+        override fun getBitmap(presentationTimeUs: Long): Bitmap {
+            outputBitmap.eraseColor(Color.TRANSPARENT)
+            val frame = retriever.getFrameAtTime(presentationTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                ?: return outputBitmap
+
+            val scaledFrame = Bitmap.createScaledBitmap(frame, targetWidth, targetHeight, true)
+            if (frame != scaledFrame) frame.recycle()
+
+            if (isCutout && maskBitmapProvider != null) {
+                val mask = maskBitmapProvider.invoke(presentationTimeUs)
+                if (mask != null && !mask.isRecycled) {
+                    val scaledMask = Bitmap.createScaledBitmap(mask, targetWidth, targetHeight, true)
+                    canvas.drawBitmap(scaledFrame, 0f, 0f, paint)
+                    canvas.drawBitmap(scaledMask, 0f, 0f, maskPaint)
+                    if (mask != scaledMask) scaledMask.recycle()
+                } else {
+                    // Fallback to left half (Left Clone)
+                    val splitPx = (targetWidth * splitX).toInt()
+                    val srcRect = Rect(0, 0, splitPx, targetHeight)
+                    val dstRect = Rect(0, 0, splitPx, targetHeight)
+                    canvas.drawBitmap(scaledFrame, srcRect, dstRect, paint)
+                }
+            } else {
+                // Left half split screen (Left Clone)
+                val splitPx = (targetWidth * splitX).toInt()
+                val srcRect = Rect(0, 0, splitPx, targetHeight)
+                val dstRect = Rect(0, 0, splitPx, targetHeight)
+                canvas.drawBitmap(scaledFrame, srcRect, dstRect, paint)
+            }
+
+            scaledFrame.recycle()
+            return outputBitmap
+        }
+    }
+
     private class SubtitleBitmapOverlay(
         private val captions: List<Caption>,
         private val targetWidth: Int = 1080,
