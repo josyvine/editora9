@@ -281,7 +281,7 @@ class Media3TransformerEngine(private val context: Context) {
 
         // 6. Build the Base Video Sequence (Track 1)
         val baseSequence = if (compositeLayers.isNotEmpty()) {
-            // CLONE MODE: Clip Track 1 to Take 1 (Right Clone)
+            // CLONE MODE: Clip Track 1 to match the full take duration
             val baseLayer = compositeLayers.firstOrNull { it.layerOrder == 0 }
             val firstOverlayLayer = compositeLayers.firstOrNull { it.layerOrder > 0 } ?: compositeLayers.first()
             val overlayDuration = firstOverlayLayer.getResolvedEndMs() - firstOverlayLayer.getResolvedStartMs()
@@ -322,6 +322,8 @@ class Media3TransformerEngine(private val context: Context) {
         // 7. Add Parallel Overlay Video Sequences if Composite Layers exist (Track 2+)
         if (compositeLayers.isNotEmpty()) {
             val sourceUriToUse = overlaySourceUri ?: inputUri
+            val isPreTrimmed = overlaySourceUri != null
+
             for (layer in compositeLayers) {
                 if (layer.layerOrder > 0) {
                     val overlayEffects = mutableListOf<Effect>()
@@ -359,13 +361,13 @@ class Media3TransformerEngine(private val context: Context) {
                             )
                         )
                     } else {
-                        // Default vertical split mask for clone overlay (splits screen at 50% with feather)
+                        // Default vertical split mask for clone overlay (splits screen at 48% with feather)
                         overlayEffects.add(
                             CompositeMaskGlEffect(
                                 maskType = CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL,
-                                startSplitPos = 0.50f,
-                                endSplitPos = 0.50f,
-                                feather = 0.05f,
+                                startSplitPos = 0.48f,
+                                endSplitPos = 0.48f,
+                                feather = 0.03f,
                                 isInverted = false,
                                 rectBounds = floatArrayOf(0f, 0f, 1f, 1f),
                                 startTimeUs = 0L,
@@ -393,16 +395,20 @@ class Media3TransformerEngine(private val context: Context) {
                         overlayEffects.add(ColorFilterGlEffect(colorGrade))
                     }
 
-                    // Track 2 clips raw file at Take 2 (e.g., 16.5s to 21.5s); Media3 automatically presents it starting at t=0
-                    val overlayMediaItem = MediaItem.Builder()
-                        .setUri(sourceUriToUse)
-                        .setClippingConfiguration(
-                            MediaItem.ClippingConfiguration.Builder()
-                                .setStartPositionMs(layer.getResolvedStartMs())
-                                .setEndPositionMs(layer.getResolvedEndMs())
-                                .build()
-                        )
-                        .build()
+                    // When pre-trimmed, start from byte 0 directly without seeking (prevents decoder deadlock)
+                    val overlayMediaItem = if (isPreTrimmed) {
+                        MediaItem.fromUri(sourceUriToUse)
+                    } else {
+                        MediaItem.Builder()
+                            .setUri(sourceUriToUse)
+                            .setClippingConfiguration(
+                                MediaItem.ClippingConfiguration.Builder()
+                                    .setStartPositionMs(layer.getResolvedStartMs())
+                                    .setEndPositionMs(layer.getResolvedEndMs())
+                                    .build()
+                            )
+                            .build()
+                    }
 
                     val editedOverlayItem = EditedMediaItem.Builder(overlayMediaItem)
                         .setRemoveAudio(true) // Prevent duplicate echo/room-noise phase clash
