@@ -9,12 +9,9 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.media.MediaMetadataRetriever
 import android.net.Uri
-import android.util.Size
 import androidx.annotation.OptIn
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
-import androidx.media3.common.OverlaySettings
-import androidx.media3.common.VideoCompositorSettings
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.BitmapOverlay
 import androidx.media3.effect.Crop
@@ -22,7 +19,6 @@ import androidx.media3.effect.OverlayEffect
 import androidx.media3.effect.Presentation
 import androidx.media3.effect.ScaleAndRotateTransformation
 import androidx.media3.effect.SpeedChangeEffect
-import androidx.media3.effect.StaticOverlaySettings
 import androidx.media3.effect.TextureOverlay
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
@@ -378,7 +374,6 @@ class Media3TransformerEngine(private val context: Context) {
                         )
                     }
 
-                    // Apply matching global presentation and grading to Track 2
                     when (targetAspectRatio) {
                         "9:16" -> overlayEffects.add(0, Presentation.createForAspectRatio(9f / 16f, Presentation.LAYOUT_SCALE_TO_FIT))
                         "16:9" -> overlayEffects.add(0, Presentation.createForAspectRatio(16f / 9f, Presentation.LAYOUT_SCALE_TO_FIT))
@@ -438,23 +433,8 @@ class Media3TransformerEngine(private val context: Context) {
             masterSequenceList.add(EditedMediaItemSequence(editedAudioItem))
         }
 
-        // 9. Build Multi-Track Composition WITH VideoCompositorSettings
-        val compositionBuilder = Composition.Builder(masterSequenceList)
-
-        // CRITICAL FIX: Instructs Media3 GPU Compositor to merge both video tracks into the final frame
-        if (compositeLayers.isNotEmpty()) {
-            compositionBuilder.setVideoCompositorSettings(object : VideoCompositorSettings {
-                override fun getOutputSize(inputSizes: List<Size>): Size {
-                    return inputSizes.firstOrNull() ?: Size(resolvedWidth, resolvedHeight)
-                }
-
-                override fun getOverlaySettings(inputId: Int, presentationTimeUs: Long): OverlaySettings {
-                    return StaticOverlaySettings.Builder().build()
-                }
-            })
-        }
-
-        val composition = compositionBuilder.build()
+        // Standard Media3 Composition for your library version
+        val composition = Composition.Builder(masterSequenceList).build()
         runTransformer(composition, outputFile)
     }
 
