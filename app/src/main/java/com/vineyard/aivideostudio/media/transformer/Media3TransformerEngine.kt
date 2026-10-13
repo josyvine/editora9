@@ -4,12 +4,13 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
+import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.media.MediaMetadataRetriever
 import android.net.Uri
@@ -229,7 +230,7 @@ class Media3TransformerEngine(private val context: Context) {
 
         val overlayList = mutableListOf<TextureOverlay>()
 
-        // 1. CLONE OVERLAY: Bakes Take 2 (Left Clone) with upright rotation & cutout into video frames
+        // 1. CLONE OVERLAY: Renders upright Left Clone with seamless feathered blend into Track 1
         if (compositeLayers.isNotEmpty() && overlaySourceUri != null) {
             val overlayFile = runCatching {
                 if (overlaySourceUri.scheme == "file") File(overlaySourceUri.path ?: "") else File(overlaySourceUri.path ?: "")
@@ -280,7 +281,7 @@ class Media3TransformerEngine(private val context: Context) {
         val shouldStripAudio = stripOriginalAudio
         val masterSequenceList = mutableListOf<EditedMediaItemSequence>()
 
-        // 2. Build Base Video Sequence (Track 1: Right Clone with Left Clone baked in)
+        // 2. Build Base Video Sequence (Track 1: Right Clone)
         val baseSequence = if (compositeLayers.isNotEmpty()) {
             val baseLayer = compositeLayers.firstOrNull { it.layerOrder == 0 }
             val firstOverlayLayer = compositeLayers.firstOrNull { it.layerOrder > 0 } ?: compositeLayers.first()
@@ -538,7 +539,7 @@ class Media3TransformerEngine(private val context: Context) {
 
     /**
      * Renders the secondary clone take directly into the frame buffer as an OpenGL overlay.
-     * Corrects phone portrait 90° sensor rotation so the clone is upright and proportionate.
+     * Uses a smooth alpha gradient over the glass door seam so the boundary is completely invisible.
      */
     private class CloneVideoBitmapOverlay(
         private val overlayVideoFile: File,
@@ -553,14 +554,6 @@ class Media3TransformerEngine(private val context: Context) {
             setDataSource(overlayVideoFile.absolutePath)
         }
 
-        private val rotationDegrees: Int = try {
-            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-        } catch (_: Exception) { 0 }
-
-        private val rotationMatrix: Matrix? = if (rotationDegrees != 0) {
-            Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-        } else null
-
         private val outputBitmap: Bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
         private val canvas: Canvas = Canvas(outputBitmap)
         private val paint: Paint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -568,41 +561,48 @@ class Media3TransformerEngine(private val context: Context) {
             xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
         }
 
+        // Feathered gradient paint: blends seamlessly over the glass door center frame
+        private val gradientPaint: Paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
+        }
+
+        init {
+            val splitPx = targetWidth * splitX
+            val featherPx = targetWidth * 0.05f // 5% smooth gradient feather
+            gradientPaint.shader = LinearGradient(
+                splitPx - featherPx, 0f,
+                splitPx + featherPx, 0f,
+                intArrayOf(Color.WHITE, Color.TRANSPARENT),
+                floatArrayOf(0f, 1f),
+                Shader.TileMode.CLAMP
+            )
+        }
+
         override fun getBitmap(presentationTimeUs: Long): Bitmap {
             outputBitmap.eraseColor(Color.TRANSPARENT)
+            
+            // On Android 8.0+, getFrameAtTime automatically returns the upright frame
             val rawFrame = retriever.getFrameAtTime(presentationTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                 ?: return outputBitmap
 
-            // CRITICAL FIX: Rotate sideways raw frame upright before scaling to target resolution
-            val uprightFrame = if (rotationMatrix != null) {
-                Bitmap.createBitmap(rawFrame, 0, 0, rawFrame.width, rawFrame.height, rotationMatrix, true).also {
-                    if (it != rawFrame) rawFrame.recycle()
-                }
-            } else {
-                rawFrame
-            }
+            val scaledFrame = Bitmap.createScaledBitmap(rawFrame, targetWidth, targetHeight, true)
+            if (rawFrame != scaledFrame) rawFrame.recycle()
 
-            val scaledFrame = Bitmap.createScaledBitmap(uprightFrame, targetWidth, targetHeight, true)
-            if (uprightFrame != scaledFrame) uprightFrame.recycle()
+            canvas.drawBitmap(scaledFrame, 0f, 0f, paint)
 
             if (isCutout && maskBitmapProvider != null) {
                 val mask = maskBitmapProvider.invoke(presentationTimeUs)
                 if (mask != null && !mask.isRecycled) {
                     val scaledMask = Bitmap.createScaledBitmap(mask, targetWidth, targetHeight, true)
-                    canvas.drawBitmap(scaledFrame, 0f, 0f, paint)
                     canvas.drawBitmap(scaledMask, 0f, 0f, maskPaint)
                     if (mask != scaledMask) scaledMask.recycle()
                 } else {
-                    val splitPx = (targetWidth * splitX).toInt()
-                    val srcRect = Rect(0, 0, splitPx, targetHeight)
-                    val dstRect = Rect(0, 0, splitPx, targetHeight)
-                    canvas.drawBitmap(scaledFrame, srcRect, dstRect, paint)
+                    // Seamless gradient fade over the glass door seam
+                    canvas.drawRect(0f, 0f, targetWidth.toFloat(), targetHeight.toFloat(), gradientPaint)
                 }
             } else {
-                val splitPx = (targetWidth * splitX).toInt()
-                val srcRect = Rect(0, 0, splitPx, targetHeight)
-                val dstRect = Rect(0, 0, splitPx, targetHeight)
-                canvas.drawBitmap(scaledFrame, srcRect, dstRect, paint)
+                // Seamless gradient fade over the glass door seam
+                canvas.drawRect(0f, 0f, targetWidth.toFloat(), targetHeight.toFloat(), gradientPaint)
             }
 
             scaledFrame.recycle()
