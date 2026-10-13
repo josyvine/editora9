@@ -589,6 +589,7 @@ class VideoProcessingPipeline(
 
         // Extract Composite Layers from Recipe (Clones, Traveling Mattes, Stunts)
         val compositeLayerDtos = recipe.editingPlan.getResolvedCompositeLayers()
+        val hasCompositeLayers = compositeLayerDtos.isNotEmpty()
 
         logger.log(
             projectId,
@@ -597,8 +598,10 @@ class VideoProcessingPipeline(
             LogSeverity.INFO
         )
 
-        // 1. SPLICE HIGHLIGHTS (Bypassed if audioOnlyMode is true)
-        if (!recipe.audioOnlyMode) {
+        // 1. SPLICE HIGHLIGHTS (Bypassed if audioOnlyMode is true OR if composite layers exist)
+        // CRITICAL FIX: If compositeLayers exist (clone mode), completely bypass highlight splicing.
+        // This ensures the source video remains 100% intact so Track 2 can access Take 2 (e.g., 16.5s to 21.5s).
+        if (!recipe.audioOnlyMode && !hasCompositeLayers) {
             val highlightSegments = recipe.editingPlan.segmentsToKeep.map { it.toHighlightSegment() }
             if (highlightSegments.isNotEmpty()) {
                 onStageChanged(PipelineStatus.TRIM_EXECUTION, "Media3 assembling ${highlightSegments.size} highlight scenes")
@@ -669,6 +672,13 @@ class VideoProcessingPipeline(
                     logger.log(projectId, PipelineStatus.ZOOM_EXECUTION, "Zoom executed (${zoomScale}x)", LogSeverity.SUCCESS)
                 }
             }
+        } else if (hasCompositeLayers) {
+            logger.log(
+                projectId,
+                PipelineStatus.TRIM_EXECUTION,
+                "Clone/Composite mode active: Preserving full unclipped source video (${String.format("%.2f", rawSourceDuration)}s) for multi-track composition.",
+                LogSeverity.INFO
+            )
         }
 
         // 4. CONSTRUCT SPEED-COMPRESSED TIMELINE MAP
