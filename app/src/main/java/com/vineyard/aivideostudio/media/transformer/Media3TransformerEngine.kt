@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
@@ -230,7 +231,7 @@ class Media3TransformerEngine(private val context: Context) {
 
         val overlayList = mutableListOf<TextureOverlay>()
 
-        // 1. CLONE OVERLAY: Renders upright Left Clone with seamless feathered blend into Track 1
+        // 1. UNIVERSAL CLONE OVERLAY: Renders secondary take with automatic orientation detection & parametric feathering
         if (compositeLayers.isNotEmpty() && overlaySourceUri != null) {
             val overlayFile = runCatching {
                 if (overlaySourceUri.scheme == "file") File(overlaySourceUri.path ?: "") else File(overlaySourceUri.path ?: "")
@@ -238,16 +239,17 @@ class Media3TransformerEngine(private val context: Context) {
 
             if (overlayFile != null && overlayFile.exists()) {
                 val overlayLayer = compositeLayers.firstOrNull { it.layerOrder > 0 } ?: compositeLayers.first()
-                val isAiCutout = maskBitmapProvider != null ||
-                        overlayLayer.mask?.shape.equals("ai_subject_cutout", ignoreCase = true) ||
-                        overlayLayer.mask?.shape.equals("auto_removal", ignoreCase = true)
+                val maskDto = overlayLayer.mask
+                val splitPos = maskDto?.startSplitPos ?: 0.50f
+                val feather = maskDto?.featherRadius ?: 0.04f
+                val isInverted = maskDto?.isInverted ?: false
 
                 overlayList.add(
-                    CloneVideoBitmapOverlay(
+                    UniversalCloneBitmapOverlay(
                         overlayVideoFile = overlayFile,
-                        maskBitmapProvider = maskBitmapProvider,
-                        splitX = overlayLayer.mask?.startSplitPos ?: 0.48f,
-                        isCutout = isAiCutout,
+                        splitPos = splitPos,
+                        featherRadius = feather,
+                        isInverted = isInverted,
                         targetWidth = resolvedWidth,
                         targetHeight = resolvedHeight
                     )
@@ -281,7 +283,7 @@ class Media3TransformerEngine(private val context: Context) {
         val shouldStripAudio = stripOriginalAudio
         val masterSequenceList = mutableListOf<EditedMediaItemSequence>()
 
-        // 2. Build Base Video Sequence (Track 1: Right Clone)
+        // 2. Build Base Video Sequence (Track 1)
         val baseSequence = if (compositeLayers.isNotEmpty()) {
             val baseLayer = compositeLayers.firstOrNull { it.layerOrder == 0 }
             val firstOverlayLayer = compositeLayers.firstOrNull { it.layerOrder > 0 } ?: compositeLayers.first()
@@ -319,7 +321,7 @@ class Media3TransformerEngine(private val context: Context) {
         }
         masterSequenceList.add(baseSequence)
 
-        // 3. MIX TAKE 2 AUDIO: Injects Take 2's dialogue ("My name is Josyvine") so both clones are heard
+        // 3. MIX OVERLAY AUDIO: Concurrently blends overlay dialogue/audio with base audio
         if (compositeLayers.isNotEmpty() && overlaySourceUri != null && !shouldStripAudio) {
             val overlayAudioItem = MediaItem.fromUri(overlaySourceUri)
             val editedOverlayAudio = EditedMediaItem.Builder(overlayAudioItem)
@@ -538,14 +540,16 @@ class Media3TransformerEngine(private val context: Context) {
     }
 
     /**
-     * Renders the secondary clone take directly into the frame buffer as an OpenGL overlay.
-     * Uses a smooth alpha gradient over the glass door seam so the boundary is completely invisible.
+     * Universal Clone Overlay Renderer.
+     * 1. Detects raw buffer orientation vs target aspect ratio dynamically on ANY Android device.
+     * 2. Automatically normalizes landscape/portrait mismatch so frames are never squashed or sideways.
+     * 3. Applies parametric feathered alpha blending across any position without hardcoded numbers.
      */
-    private class CloneVideoBitmapOverlay(
+    private class UniversalCloneBitmapOverlay(
         private val overlayVideoFile: File,
-        private val maskBitmapProvider: ((Long) -> Bitmap?)? = null,
-        private val splitX: Float = 0.48f,
-        private val isCutout: Boolean = false,
+        private val splitPos: Float = 0.50f,
+        private val featherRadius: Float = 0.04f,
+        private val isInverted: Boolean = false,
         private val targetWidth: Int = 1080,
         private val targetHeight: Int = 1920
     ) : BitmapOverlay() {
@@ -554,25 +558,33 @@ class Media3TransformerEngine(private val context: Context) {
             setDataSource(overlayVideoFile.absolutePath)
         }
 
+        private val rotationDegrees: Int = try {
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+        } catch (_: Exception) { 0 }
+
         private val outputBitmap: Bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
         private val canvas: Canvas = Canvas(outputBitmap)
         private val paint: Paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val maskPaint: Paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
-        }
 
-        // Feathered gradient paint: blends seamlessly over the glass door center frame
         private val gradientPaint: Paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
         }
 
         init {
-            val splitPx = targetWidth * splitX
-            val featherPx = targetWidth * 0.05f // 5% smooth gradient feather
+            val splitPx = targetWidth * splitPos.coerceIn(0.05f, 0.95f)
+            val featherPx = targetWidth * featherRadius.coerceIn(0.001f, 0.20f)
+
+            // Fully parametric: isInverted dynamically chooses which side is kept opaque
+            val gradientColors = if (isInverted) {
+                intArrayOf(Color.TRANSPARENT, Color.WHITE)
+            } else {
+                intArrayOf(Color.WHITE, Color.TRANSPARENT)
+            }
+
             gradientPaint.shader = LinearGradient(
                 splitPx - featherPx, 0f,
                 splitPx + featherPx, 0f,
-                intArrayOf(Color.WHITE, Color.TRANSPARENT),
+                gradientColors,
                 floatArrayOf(0f, 1f),
                 Shader.TileMode.CLAMP
             )
@@ -580,30 +592,35 @@ class Media3TransformerEngine(private val context: Context) {
 
         override fun getBitmap(presentationTimeUs: Long): Bitmap {
             outputBitmap.eraseColor(Color.TRANSPARENT)
-            
-            // On Android 8.0+, getFrameAtTime automatically returns the upright frame
+
             val rawFrame = retriever.getFrameAtTime(presentationTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                 ?: return outputBitmap
 
-            val scaledFrame = Bitmap.createScaledBitmap(rawFrame, targetWidth, targetHeight, true)
-            if (rawFrame != scaledFrame) rawFrame.recycle()
-
-            canvas.drawBitmap(scaledFrame, 0f, 0f, paint)
-
-            if (isCutout && maskBitmapProvider != null) {
-                val mask = maskBitmapProvider.invoke(presentationTimeUs)
-                if (mask != null && !mask.isRecycled) {
-                    val scaledMask = Bitmap.createScaledBitmap(mask, targetWidth, targetHeight, true)
-                    canvas.drawBitmap(scaledMask, 0f, 0f, maskPaint)
-                    if (mask != scaledMask) scaledMask.recycle()
-                } else {
-                    // Seamless gradient fade over the glass door seam
-                    canvas.drawRect(0f, 0f, targetWidth.toFloat(), targetHeight.toFloat(), gradientPaint)
+            // UNIVERSAL ORIENTATION NORMALIZATION:
+            // Checks if target is portrait (height > width) while raw buffer is landscape (width > height), or vice versa.
+            val normalizedFrame = if (targetHeight > targetWidth && rawFrame.width > rawFrame.height) {
+                // Buffer is landscape, canvas is portrait: rotate into upright orientation
+                val angle = if (rotationDegrees != 0) rotationDegrees.toFloat() else 90f
+                val matrix = Matrix().apply { postRotate(angle) }
+                Bitmap.createBitmap(rawFrame, 0, 0, rawFrame.width, rawFrame.height, matrix, true).also {
+                    if (it != rawFrame) rawFrame.recycle()
+                }
+            } else if (targetWidth > targetHeight && rawFrame.height > rawFrame.width) {
+                // Buffer is portrait, canvas is landscape: rotate into landscape
+                val angle = if (rotationDegrees != 0) rotationDegrees.toFloat() else 90f
+                val matrix = Matrix().apply { postRotate(angle) }
+                Bitmap.createBitmap(rawFrame, 0, 0, rawFrame.width, rawFrame.height, matrix, true).also {
+                    if (it != rawFrame) rawFrame.recycle()
                 }
             } else {
-                // Seamless gradient fade over the glass door seam
-                canvas.drawRect(0f, 0f, targetWidth.toFloat(), targetHeight.toFloat(), gradientPaint)
+                rawFrame
             }
+
+            val scaledFrame = Bitmap.createScaledBitmap(normalizedFrame, targetWidth, targetHeight, true)
+            if (normalizedFrame != scaledFrame) normalizedFrame.recycle()
+
+            canvas.drawBitmap(scaledFrame, 0f, 0f, paint)
+            canvas.drawRect(0f, 0f, targetWidth.toFloat(), targetHeight.toFloat(), gradientPaint)
 
             scaledFrame.recycle()
             return outputBitmap
