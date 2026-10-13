@@ -600,7 +600,7 @@ class VideoProcessingPipeline(
 
         // 1. SPLICE HIGHLIGHTS (Bypassed if audioOnlyMode is true OR if composite layers exist)
         // CRITICAL FIX: If compositeLayers exist (clone mode), completely bypass highlight splicing.
-        // This ensures the source video remains 100% intact so Track 2 can access Take 2 (e.g., 16.5s to 21.5s).
+        // This ensures the source video remains 100% intact so Track 2 can access Take 2 (e.g., 15s to 23.5s).
         if (!recipe.audioOnlyMode && !hasCompositeLayers) {
             val highlightSegments = recipe.editingPlan.segmentsToKeep.map { it.toHighlightSegment() }
             if (highlightSegments.isNotEmpty()) {
@@ -686,6 +686,13 @@ class VideoProcessingPipeline(
         if (!recipe.audioOnlyMode && recipe.editingPlan.segmentsToKeep.isNotEmpty()) {
             val highlightSegments = recipe.editingPlan.segmentsToKeep.map { it.toHighlightSegment() }
             timelineMap = TimelineMapper.applyHighlightSplice(timelineMap, highlightSegments)
+        } else if (hasCompositeLayers && recipe.editingPlan.segmentsToKeep.isEmpty()) {
+            // If segmentsToKeep was omitted, automatically infer timeline duration from composite layer
+            val firstOverlay = compositeLayerDtos.firstOrNull { it.layerOrder > 0 } ?: compositeLayerDtos.first()
+            val overlayDurationSec = (firstOverlay.getResolvedEndMs() - firstOverlay.getResolvedStartMs()) / 1000.0
+            if (overlayDurationSec > 0.0) {
+                timelineMap = TimelineMap.identity(projectId, overlayDurationSec)
+            }
         }
         if (speedSpecs.isNotEmpty()) {
             timelineMap = timelineMap.withSpeedRamps(speedSpecs)
@@ -890,10 +897,45 @@ class VideoProcessingPipeline(
         val remappedBlurSpecs = TimelineMapper.remapBlurSpecs(timelineMap, fullyCalibratedBlurSpecs)
         val remappedTrackingIndicators = TimelineMapper.remapTrackingIndicators(timelineMap, fullyCalibratedTrackingIndicators)
 
+        // CRITICAL ANTI-DEADLOCK FIX: Pre-trim the overlay take (Take 2) into a standalone file at t=0
+        // This avoids concurrent hardware seeks on the same 24s file that caused MediaCodec to deadlock from 7:41 AM to 11:50 AM.
+        var resolvedOverlayUri: Uri? = null
+        if (hasCompositeLayers) {
+            val overlayLayer = compositeLayerDtos.firstOrNull { it.layerOrder > 0 } ?: compositeLayerDtos.first()
+            val overlayStartMs = overlayLayer.getResolvedStartMs()
+            val overlayEndMs = overlayLayer.getResolvedEndMs()
+
+            if (overlayEndMs > overlayStartMs) {
+                val tempOverlayFile = storageManager.createStageOutputFile(projectId, PipelineStatus.TRIM_EXECUTION)
+                logger.log(
+                    projectId,
+                    PipelineStatus.TRIM_EXECUTION,
+                    "Pre-trimming overlay take ($overlayStartMs ms to $overlayEndMs ms) to prevent decoder seek deadlock...",
+                    LogSeverity.INFO
+                )
+                val preTrimResult = transformerEngine.trimVideo(
+                    inputUri = Uri.parse(currentVideoUri),
+                    outputFile = tempOverlayFile,
+                    startMs = overlayStartMs,
+                    endMs = overlayEndMs,
+                    stripAudio = true
+                )
+                if (preTrimResult is AppResult.Success && tempOverlayFile.exists() && tempOverlayFile.length() > 0L) {
+                    resolvedOverlayUri = Uri.fromFile(tempOverlayFile)
+                    logger.log(
+                        projectId,
+                        PipelineStatus.TRIM_EXECUTION,
+                        "Pre-trimmed overlay take ready (${tempOverlayFile.length()} bytes) at t=0.",
+                        LogSeverity.SUCCESS
+                    )
+                }
+            }
+        }
+
         logger.log(
             projectId,
             PipelineStatus.EXPORTING,
-            "Starting Media3 Hardware Export: Slices=${speedSpecs.size + 1} | Highlights=${remappedTrackingIndicators.size} | Overlays=${remappedReplacementOverlays.size} | Cards=${remappedTextCards.size} | Blurs=${remappedBlurSpecs.size} | CompositeLayers=${compositeLayerDtos.size} | PurgeSourceAudio=true",
+            "Starting Media3 Hardware Export: Slices=${speedSpecs.size + 1} | Highlights=${remappedTrackingIndicators.size} | Overlays=${remappedReplacementOverlays.size} | Cards=${remappedTextCards.size} | Blurs=${remappedBlurSpecs.size} | CompositeLayers=${compositeLayerDtos.size} | PurgeSourceAudio=${!recipe.isOriginalAudioPreserved()}",
             LogSeverity.INFO
         )
 
@@ -919,7 +961,7 @@ class VideoProcessingPipeline(
             compositeLayers = compositeLayerDtos,
             videoWidth = project.metadata.width,
             videoHeight = project.metadata.height,
-            overlaySourceUri = Uri.parse(project.sourceUri ?: currentVideoUri)
+            overlaySourceUri = resolvedOverlayUri ?: Uri.parse(project.sourceUri ?: currentVideoUri)
         )
 
         val finalVideoUri = when (exportResult) {
