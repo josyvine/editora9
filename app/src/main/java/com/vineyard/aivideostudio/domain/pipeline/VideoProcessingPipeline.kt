@@ -4,6 +4,10 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.segmentation.subject.SubjectSegmentation
+import com.google.mlkit.vision.segmentation.subject.SubjectSegmenterOptions
 import com.vineyard.aivideostudio.ai.gemini.GeminiClient
 import com.vineyard.aivideostudio.ai.model.AiQaResponse
 import com.vineyard.aivideostudio.ai.model.CaptionDecision
@@ -67,6 +71,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.TreeMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.coroutineContext
 
@@ -898,8 +903,9 @@ class VideoProcessingPipeline(
         val remappedTrackingIndicators = TimelineMapper.remapTrackingIndicators(timelineMap, fullyCalibratedTrackingIndicators)
 
         // CRITICAL ANTI-DEADLOCK FIX: Pre-trim the overlay take (Take 2) into a standalone file at t=0
-        // This avoids concurrent hardware seeks on the same 24s file that caused MediaCodec to deadlock from 7:41 AM to 11:50 AM.
         var resolvedOverlayUri: Uri? = null
+        var maskBitmapProvider: ((Long) -> Bitmap?)? = null
+
         if (hasCompositeLayers) {
             val overlayLayer = compositeLayerDtos.firstOrNull { it.layerOrder > 0 } ?: compositeLayerDtos.first()
             val overlayStartMs = overlayLayer.getResolvedStartMs()
@@ -928,6 +934,22 @@ class VideoProcessingPipeline(
                         "Pre-trimmed overlay take ready (${tempOverlayFile.length()} bytes) at t=0.",
                         LogSeverity.SUCCESS
                     )
+
+                    // CapCut-Style Auto Background Removal (Subject Cutout):
+                    // Extract on-device ML Kit foreground subject masks across Take 2
+                    val isAiCutoutRequested = overlayLayer.mask?.shape.equals("ai_subject_cutout", ignoreCase = true) ||
+                            overlayLayer.mask?.shape.equals("auto_removal", ignoreCase = true)
+
+                    if (isAiCutoutRequested) {
+                        onStageChanged(PipelineStatus.TRIM_EXECUTION, "ML Kit extracting AI subject cutout masks...")
+                        logger.log(
+                            projectId,
+                            PipelineStatus.TRIM_EXECUTION,
+                            "Extracting on-device AI subject cutout masks (CapCut Auto Removal)...",
+                            LogSeverity.INFO
+                        )
+                        maskBitmapProvider = extractAiSubjectMasks(tempOverlayFile, overlayEndMs - overlayStartMs)
+                    }
                 }
             }
         }
@@ -940,7 +962,6 @@ class VideoProcessingPipeline(
         )
 
         // Dynamic audio retention: If script specifies keepOriginalAudio = true, keep original sound.
-        // Otherwise, persist your exact default logic: purge original audio (true) to replace with TTS.
         val shouldStripOriginalAudio = !recipe.isOriginalAudioPreserved()
 
         val finalOutputFile = storageManager.createFinalOutputFile(projectId)
@@ -961,7 +982,8 @@ class VideoProcessingPipeline(
             compositeLayers = compositeLayerDtos,
             videoWidth = project.metadata.width,
             videoHeight = project.metadata.height,
-            overlaySourceUri = resolvedOverlayUri ?: Uri.parse(project.sourceUri ?: currentVideoUri)
+            overlaySourceUri = resolvedOverlayUri ?: Uri.parse(project.sourceUri ?: currentVideoUri),
+            maskBitmapProvider = maskBitmapProvider
         )
 
         val finalVideoUri = when (exportResult) {
@@ -1008,6 +1030,76 @@ class VideoProcessingPipeline(
 
         val updatedProject = projectRepository.getProjectById(projectId) ?: project
         AppResult.Success(updatedProject)
+    }
+
+    /**
+     * Extracts on-device Google ML Kit Subject Segmentation masks for each frame of the overlay take.
+     * Operates offline on Android hardware to isolate the person and eliminate all background.
+     */
+    private suspend fun extractAiSubjectMasks(
+        videoFile: File,
+        durationMs: Long
+    ): ((Long) -> Bitmap?)? = withContext(Dispatchers.Default) {
+        val maskMap = TreeMap<Long, Bitmap>()
+        val retriever = MediaMetadataRetriever()
+
+        return@withContext try {
+            retriever.setDataSource(videoFile.absolutePath)
+            val segmenterOptions = SubjectSegmenterOptions.Builder()
+                .enableForegroundBitmap()
+                .build()
+            val segmenter = SubjectSegmentation.getClient(segmenterOptions)
+
+            val frameStepMs = 66L // ~15fps sampling for rapid, fluid segmentation
+            var timeCursorMs = 0L
+
+            while (timeCursorMs <= durationMs) {
+                val timeUs = timeCursorMs * 1000L
+                val frameBitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                if (frameBitmap != null) {
+                    try {
+                        val inputImage = InputImage.fromBitmap(frameBitmap, 0)
+                        val result = Tasks.await(segmenter.process(inputImage))
+                        val fgBitmap = result.foregroundBitmap
+                        if (fgBitmap != null) {
+                            maskMap[timeUs] = fgBitmap
+                        }
+                    } catch (_: Exception) {
+                    } finally {
+                        frameBitmap.recycle()
+                    }
+                }
+                timeCursorMs += frameStepMs
+            }
+
+            if (maskMap.isNotEmpty()) {
+                logger.log(
+                    "AI_CUTOUT",
+                    PipelineStatus.TRIM_EXECUTION,
+                    "Generated ${maskMap.size} AI subject cutout masks across ${durationMs}ms.",
+                    LogSeverity.SUCCESS
+                )
+                // Frame lookup lambda: matches presentation timestamp to nearest mask in nanoseconds
+                val provider: (Long) -> Bitmap? = { presentationTimeUs ->
+                    val floor = maskMap.floorEntry(presentationTimeUs)
+                    val ceiling = maskMap.ceilingEntry(presentationTimeUs)
+                    when {
+                        floor == null -> ceiling?.value
+                        ceiling == null -> floor.value
+                        presentationTimeUs - floor.key <= ceiling.key - presentationTimeUs -> floor.value
+                        else -> ceiling.value
+                    }
+                }
+                provider
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            logger.log("AI_CUTOUT", PipelineStatus.TRIM_EXECUTION, "AI cutout extraction skipped: ${e.message}", LogSeverity.WARNING)
+            null
+        } finally {
+            try { retriever.release() } catch (_: Exception) {}
+        }
     }
 
     /**
