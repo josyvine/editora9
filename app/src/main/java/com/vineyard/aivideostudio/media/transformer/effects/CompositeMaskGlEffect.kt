@@ -162,6 +162,9 @@ internal class CompositeMaskShaderProgram(
 
         glProgram.use()
         glProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, 0)
+        // CRITICAL FIX: Always bind uMaskSampler to texture unit 1 so Media3 validation never throws IllegalStateException
+        glProgram.setSamplerTexIdUniform("uMaskSampler", maskTexId, 1)
+
         glProgram.setFloatUniform("uMaskType", effect.maskType.typeId)
         glProgram.setFloatUniform("uSplitPos", currentSplitPos)
         glProgram.setFloatUniform("uFeather", effect.feather)
@@ -169,14 +172,13 @@ internal class CompositeMaskShaderProgram(
         glProgram.setFloatUniform("uIsActive", if (isActive) 1.0f else 0.0f)
         glProgram.setFloatsUniform("uRectBounds", effect.rectBounds)
 
-        // Bind AI Cutout Alpha Mask Texture if active
+        // Upload AI Cutout Alpha Mask Texture if available for this frame
         if (effect.maskType == CompositeMaskGlEffect.MaskType.AI_SUBJECT_MATTE && effect.maskBitmapProvider != null) {
             val maskBitmap = effect.maskBitmapProvider.invoke(presentationTimeUs)
             if (maskBitmap != null && !maskBitmap.isRecycled) {
                 GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
                 GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTexId)
                 GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, maskBitmap, 0)
-                glProgram.setSamplerTexIdUniform("uMaskSampler", maskTexId, 1)
                 glProgram.setFloatUniform("uHasMaskTex", 1.0f)
             } else {
                 glProgram.setFloatUniform("uHasMaskTex", 0.0f)
