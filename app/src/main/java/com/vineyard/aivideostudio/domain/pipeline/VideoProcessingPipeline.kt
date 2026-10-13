@@ -605,8 +605,7 @@ class VideoProcessingPipeline(
         )
 
         // 1. SPLICE HIGHLIGHTS (Bypassed if audioOnlyMode is true OR if composite layers exist)
-        // CRITICAL FIX: If compositeLayers exist (clone mode), completely bypass highlight splicing.
-        // This ensures the source video remains 100% intact so Track 2 can access Take 2 (e.g., 16s to 21.2s).
+        // Ensures the source video remains 100% intact so any overlay take can be accessed anywhere on the timeline
         if (!recipe.audioOnlyMode && !hasCompositeLayers) {
             val highlightSegments = recipe.editingPlan.segmentsToKeep.map { it.toHighlightSegment() }
             if (highlightSegments.isNotEmpty()) {
@@ -682,7 +681,7 @@ class VideoProcessingPipeline(
             logger.log(
                 projectId,
                 PipelineStatus.TRIM_EXECUTION,
-                "Clone/Composite mode active: Preserving full unclipped source video (${String.format("%.2f", rawSourceDuration)}s) for multi-track composition.",
+                "Universal Clone mode active: Preserving full unclipped source video (${String.format("%.2f", rawSourceDuration)}s) for multi-track composition.",
                 LogSeverity.INFO
             )
         }
@@ -693,7 +692,7 @@ class VideoProcessingPipeline(
             val highlightSegments = recipe.editingPlan.segmentsToKeep.map { it.toHighlightSegment() }
             timelineMap = TimelineMapper.applyHighlightSplice(timelineMap, highlightSegments)
         } else if (hasCompositeLayers && recipe.editingPlan.segmentsToKeep.isEmpty()) {
-            // If segmentsToKeep was omitted, automatically infer timeline duration from composite layer
+            // Universal duration resolution: automatically infers project duration from composite take length
             val firstOverlay = compositeLayerDtos.firstOrNull { it.layerOrder > 0 } ?: compositeLayerDtos.first()
             val overlayDurationSec = (firstOverlay.getResolvedEndMs() - firstOverlay.getResolvedStartMs()) / 1000.0
             if (overlayDurationSec > 0.0) {
@@ -710,7 +709,7 @@ class VideoProcessingPipeline(
         logger.log(
             projectId,
             PipelineStatus.TRIM_ANALYSIS,
-            "Timeline Compression: Source=${String.format("%.2f", rawSourceDuration)}s -> Sped-Up=${String.format("%.2f", finalEffectiveDuration)}s (Saved ${String.format("%.2f", timeSaved)}s) | Speed Ramps=${speedSpecs.size}",
+            "Timeline Compression: Source=${String.format("%.2f", rawSourceDuration)}s -> Effective=${String.format("%.2f", finalEffectiveDuration)}s (Saved ${String.format("%.2f", timeSaved)}s) | Speed Ramps=${speedSpecs.size}",
             LogSeverity.INFO,
             speedSpecs.joinToString("\n") { "Ramp: ${it.startTimeMs}ms to ${it.endTimeMs}ms @ ${it.speedMultiplier}x" }
         )
@@ -740,12 +739,6 @@ class VideoProcessingPipeline(
         // 6. SYNCHRONIZED MULTI-CUE AUDIO SYNTHESIS ON COMPRESSED TIMELINE
         onStageChanged(PipelineStatus.TTS_GENERATION, "Synthesizing synchronized voiceover track")
         recordStep(projectId, PipelineStatus.TTS_GENERATION, StepStatus.IN_PROGRESS, "Synthesizing Audio")
-        logger.log(
-            projectId,
-            PipelineStatus.TTS_GENERATION,
-            "Synthesizing Soundtrack: ${remappedCommentarySegments.size} cues | Engine=$effectiveVoiceEngine | Mode=$effectiveCueMode (Concurrency=$effectiveConcurrency) | Voice=${recipe.commentary.voiceName ?: "Puck"} | Persona=${recipe.commentary.tone ?: "Default"}",
-            LogSeverity.INFO
-        )
 
         val commentaryAudioOutputFile = storageManager.createAudioOutputFile(projectId, "commentary_final.m4a")
         val generatedAudioFile: File? = if (remappedCommentarySegments.isNotEmpty()) {
@@ -819,8 +812,8 @@ class VideoProcessingPipeline(
             )
         }
 
-        // 7. FINAL PRODUCTION EXPORT (Target-Isolated Calibration on RAW Source Frames + Speed Remapping)
-        onStageChanged(PipelineStatus.EXPORTING, "Rendering final production with hardware speed ramping & shaders")
+        // 7. FINAL PRODUCTION EXPORT
+        onStageChanged(PipelineStatus.EXPORTING, "Rendering final production with hardware acceleration & shaders")
         recordStep(projectId, PipelineStatus.EXPORTING, StepStatus.IN_PROGRESS, "Exporting final video")
 
         val videoFileForCalibration = runCatching {
@@ -858,10 +851,9 @@ class VideoProcessingPipeline(
             emptyList()
         }
 
-        // Combine OCR-calibrated targets and non-OCR object targets before vision pass
         val combinedIndicators = calibratedOcrIndicators + nonOcrIndicators
 
-        // Pass 1: Establish Target-Isolated Dynamic Spatial Columns via Gemini Live WebSocket
+        // Pass 1: Vision ground targets
         val visionGroundedBlurSpecs = groundBlurTargetsWithVision(
             videoFile = videoFileForCalibration,
             blurSpecs = blurSpecs
@@ -872,7 +864,7 @@ class VideoProcessingPipeline(
             indicators = combinedIndicators
         )
 
-        // Pass 2: Local ML Kit applies physical contour snapping + multi-slice dynamic motion tracking across timeline
+        // Pass 2: Local ML Kit applies physical contour snapping
         val mlKitSnappedBlurSpecs = try {
             objectAnchorCalibrator.calibrateBlurSpecs(
                 videoFile = videoFileForCalibration,
@@ -891,7 +883,7 @@ class VideoProcessingPipeline(
             visionGroundedTrackingIndicators
         }
 
-        // Pass 3 (Closed-Loop Column Verification): Gemini Live inspects ML Kit's snap and verifies spatial column containment
+        // Pass 3: Column verification
         val fullyCalibratedTrackingIndicators = verifyAndCorrectTrackingTargetsWithVision(
             videoFile = videoFileForCalibration,
             indicators = mlKitSnappedIndicators
@@ -899,11 +891,12 @@ class VideoProcessingPipeline(
 
         val fullyCalibratedBlurSpecs = mlKitSnappedBlurSpecs
 
-        // Step 8: Remap Calibrated Targets to the Speed-Compressed Export Timeline
+        // Step 8: Remap Calibrated Targets to the Export Timeline
         val remappedBlurSpecs = TimelineMapper.remapBlurSpecs(timelineMap, fullyCalibratedBlurSpecs)
         val remappedTrackingIndicators = TimelineMapper.remapTrackingIndicators(timelineMap, fullyCalibratedTrackingIndicators)
 
-        // CRITICAL ANTI-DEADLOCK FIX: Pre-trim the overlay take (Take 2) into a standalone file at t=0
+        // UNIVERSAL OVERLAY EXTRACTION:
+        // Pre-trims the secondary take with 100% natural room audio preserved for concurrent multi-track mixing
         var resolvedOverlayUri: Uri? = null
         var maskBitmapProvider: ((Long) -> Bitmap?)? = null
 
@@ -920,13 +913,13 @@ class VideoProcessingPipeline(
                     "Pre-trimming overlay take ($overlayStartMs ms to $overlayEndMs ms) with audio preserved...",
                     LogSeverity.INFO
                 )
-                // CRITICAL FIX: stripAudio = false preserves Take 2's dialogue ("My name is Josyvine")
+                
                 val preTrimResult = transformerEngine.trimVideo(
                     inputUri = Uri.parse(currentVideoUri),
                     outputFile = tempOverlayFile,
                     startMs = overlayStartMs,
                     endMs = overlayEndMs,
-                    stripAudio = false
+                    stripAudio = false // Preserves speech/audio on any video
                 )
                 if (preTrimResult is AppResult.Success && tempOverlayFile.exists() && tempOverlayFile.length() > 0L) {
                     resolvedOverlayUri = Uri.fromFile(tempOverlayFile)
@@ -963,10 +956,9 @@ class VideoProcessingPipeline(
             LogSeverity.INFO
         )
 
-        // Dynamic audio retention: If script specifies keepOriginalAudio = true, keep original sound.
         val shouldStripOriginalAudio = !recipe.isOriginalAudioPreserved()
-
         val finalOutputFile = storageManager.createFinalOutputFile(projectId)
+
         val exportResult = transformerEngine.exportVideo(
             inputUri = Uri.parse(currentVideoUri),
             outputFile = finalOutputFile,
@@ -1025,7 +1017,7 @@ class VideoProcessingPipeline(
         logger.log(
             projectId,
             PipelineStatus.COMPLETED,
-            "Master Recipe Production Complete! Rendered ${finalOutputFile.length()} bytes (${String.format("%.2f", finalEffectiveDuration)}s) with replaced AI audio.",
+            "Master Recipe Production Complete! Rendered ${finalOutputFile.length()} bytes (${String.format("%.2f", finalEffectiveDuration)}s).",
             LogSeverity.SUCCESS
         )
         onStageChanged(PipelineStatus.COMPLETED, "Production complete! Video ready.")
@@ -1121,10 +1113,6 @@ class VideoProcessingPipeline(
         }
     }
 
-    /**
-     * Pass 1: Proposes initial target coordinates via Gemini Live Bidi WebSocket stream.
-     * Instructs Gemini Vision to locate the true visual center-of-mass and tight bounding box of the target object.
-     */
     private suspend fun groundTrackingTargetsWithVision(
         videoFile: File,
         indicators: List<TrackingIndicatorSpec>
@@ -1160,22 +1148,6 @@ class VideoProcessingPipeline(
 
                 if (visionResult is AppResult.Success) {
                     val visionBounds = visionResult.data
-                    val scriptBounds = indicator.staticBounds ?: visionBounds
-
-                    val scriptCenterX = (scriptBounds.left + scriptBounds.right) / 2f
-                    val scriptCenterY = (scriptBounds.top + scriptBounds.bottom) / 2f
-                    val visionCenterX = (visionBounds.left + visionBounds.right) / 2f
-                    val visionCenterY = (visionBounds.top + visionBounds.bottom) / 2f
-
-                    val deltaX = visionCenterX - scriptCenterX
-                    val deltaY = visionCenterY - scriptCenterY
-
-                    logger.log(
-                        "CALIBRATION",
-                        PipelineStatus.EXPORTING,
-                        "👁️ [LIVE-WS-COLUMN-PROPOSE] Target '${indicator.id}' ($targetDesc) grounded: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}, R:${"%.3f".format(visionBounds.right)}, B:${"%.3f".format(visionBounds.bottom)} | Center=(X:${"%.3f".format(visionCenterX)}, Y:${"%.3f".format(visionCenterY)}) | Script Drift: ΔX=${"%.3f".format(deltaX)}, ΔY=${"%.3f".format(deltaY)}",
-                        LogSeverity.INFO
-                    )
                     indicator.copy(staticBounds = visionBounds)
                 } else {
                     indicator
@@ -1189,10 +1161,6 @@ class VideoProcessingPipeline(
         }
     }
 
-    /**
-     * Pass 3 (Closed-Loop Column Verification): Gemini Live inspects the candidate coordinates produced by ML Kit.
-     * Enforces that the tool points accurately at the physical target surface without floating offset.
-     */
     private suspend fun verifyAndCorrectTrackingTargetsWithVision(
         videoFile: File,
         indicators: List<TrackingIndicatorSpec>
@@ -1228,16 +1196,6 @@ class VideoProcessingPipeline(
 
                 if (verificationResult is AppResult.Success) {
                     val verifiedBounds = verificationResult.data
-                    val vCenterX = (verifiedBounds.left + verifiedBounds.right) / 2f
-                    val vCenterY = (verifiedBounds.top + verifiedBounds.bottom) / 2f
-                    val correctionDist = kotlin.math.hypot((vCenterX - candidateCenterX).toDouble(), (vCenterY - candidateCenterY).toDouble()).toFloat()
-
-                    logger.log(
-                        "CALIBRATION",
-                        PipelineStatus.EXPORTING,
-                        "🔄 [CLOSED-LOOP-AUTOFIX-REPORT] Target '$targetDesc' Verified: Box=[L:${"%.3f".format(verifiedBounds.left)}, T:${"%.3f".format(verifiedBounds.top)}, R:${"%.3f".format(verifiedBounds.right)}, B:${"%.3f".format(verifiedBounds.bottom)}] | Center=(X:${"%.3f".format(vCenterX)}, Y:${"%.3f".format(vCenterY)}) | Correction Distance: ${"%.3f".format(correctionDist)} | Verdict: PASS",
-                        LogSeverity.SUCCESS
-                    )
                     indicator.copy(staticBounds = verifiedBounds)
                 } else {
                     indicator
@@ -1251,9 +1209,6 @@ class VideoProcessingPipeline(
         }
     }
 
-    /**
-     * Pass 1 (Blur Targets): Establishes distinct spatial columns per target without cross-subject collision.
-     */
     private suspend fun groundBlurTargetsWithVision(
         videoFile: File,
         blurSpecs: List<BlurSpec>
@@ -1289,12 +1244,6 @@ class VideoProcessingPipeline(
 
                 if (visionResult is AppResult.Success) {
                     val visionBounds = visionResult.data
-                    logger.log(
-                        "CALIBRATION",
-                        PipelineStatus.EXPORTING,
-                        "👁️ [LIVE-WS-COLUMN-BLUR] Blur target '$targetId' ($targetDesc) column grounded: L:${"%.3f".format(visionBounds.left)}, T:${"%.3f".format(visionBounds.top)}",
-                        LogSeverity.INFO
-                    )
                     spec.copy(bounds = visionBounds)
                 } else {
                     spec
@@ -1308,10 +1257,6 @@ class VideoProcessingPipeline(
         }
     }
 
-    /**
-     * Synthesizes timestamped commentary cues with silence padding.
-     * Supports both "live" (Unlimited Live API) and "tts" (REST TTS) engines.
-     */
     private suspend fun synthesizeSegmentedCommentary(
         projectId: String,
         segments: List<CommentarySegmentDto>,
@@ -1323,14 +1268,13 @@ class VideoProcessingPipeline(
         voiceEngine: String = "live"
     ): File? = withContext(Dispatchers.IO) {
         val sampleRate = 24_000
-        val bytesPerSec = sampleRate * 2 // 16-bit mono = 48,000 bytes/second
+        val bytesPerSec = sampleRate * 2
         val tempPcmFile = storageManager.createAudioOutputFile(projectId, "commentary_timeline_composite.pcm")
         val sortedSegments = segments.sortedBy { it.start ?: 0.0 }
         val totalCues = sortedSegments.size
         val isMultiple = cueMode.equals("multiple", ignoreCase = true) && concurrency > 1
 
         try {
-            // Step A: Synthesize cues (in parallel or sequentially) using the designated voiceEngine
             val segmentPcmFiles = if (isMultiple) {
                 val semaphore = Semaphore(concurrency)
                 val completedCount = AtomicInteger(0)
@@ -1339,13 +1283,7 @@ class VideoProcessingPipeline(
                     sortedSegments.mapIndexed { idx, seg ->
                         async(Dispatchers.IO) {
                             semaphore.withPermit {
-                                val current = completedCount.incrementAndGet()
-                                logger.log(
-                                    projectId,
-                                    PipelineStatus.TTS_GENERATION,
-                                    "Synthesizing Cue $current/$totalCues [${String.format("%.1f", seg.start ?: 0.0)}s] (Engine: $voiceEngine): \"${seg.text.take(35)}...\"",
-                                    LogSeverity.INFO
-                                )
+                                completedCount.incrementAndGet()
                                 synthesizeSingleCueToPcm(projectId, idx, seg, tone, voiceName, voiceEngine)
                             }
                         }
@@ -1353,17 +1291,10 @@ class VideoProcessingPipeline(
                 }
             } else {
                 sortedSegments.mapIndexed { idx, seg ->
-                    logger.log(
-                        projectId,
-                        PipelineStatus.TTS_GENERATION,
-                        "Synthesizing Cue ${idx + 1}/$totalCues [${String.format("%.1f", seg.start ?: 0.0)}s] (Engine: $voiceEngine): \"${seg.text.take(35)}...\"",
-                        LogSeverity.INFO
-                    )
                     synthesizeSingleCueToPcm(projectId, idx, seg, tone, voiceName, voiceEngine)
                 }
             }
 
-            // Step B: Stitch synthesized PCM cues in exact chronological order with digital silence padding
             tempPcmFile.outputStream().use { outputStream ->
                 var currentTimelineByteOffset = 0L
 
@@ -1414,10 +1345,6 @@ class VideoProcessingPipeline(
         return@withContext null
     }
 
-    /**
-     * Synthesizes an individual cue segment to a temporary PCM file based on selected engine.
-     * Uses dynamic JSON tone/persona in Script Mode.
-     */
     private suspend fun synthesizeSingleCueToPcm(
         projectId: String,
         idx: Int,
@@ -1431,8 +1358,6 @@ class VideoProcessingPipeline(
 
         if (isLiveEngine) {
             val segPcmFile = storageManager.createAudioOutputFile(projectId, "seg_${idx}_raw.pcm")
-            
-            // Dynamic Persona Prompt: Uses the exact character instruction provided in the Master JSON
             val characterPersona = if (!tone.isNullOrBlank()) {
                 "$tone. Recite the following script verbatim."
             } else {
@@ -1450,17 +1375,8 @@ class VideoProcessingPipeline(
             if (segTtsResult is AppResult.Success && segPcmFile.exists() && segPcmFile.length() > 0L) {
                 return segPcmFile
             }
-
-            // In Live mode, do NOT fall back to REST TTS to prevent hitting the 3 RPM / 10 RPD limit.
-            logger.log(
-                projectId,
-                PipelineStatus.TTS_GENERATION,
-                "Live Voice generation alert for Cue ${idx + 1}: ${if (segTtsResult is AppResult.Error) segTtsResult.error.message else "Incomplete stream"}",
-                LogSeverity.WARNING
-            )
             return if (segPcmFile.exists() && segPcmFile.length() > 0L) segPcmFile else null
         } else {
-            // REST TTS Engine explicitly requested
             val segFallbackPcm = storageManager.createAudioOutputFile(projectId, "seg_${idx}_fb.pcm")
             val segM4a = storageManager.createAudioOutputFile(projectId, "seg_${idx}_fb.m4a")
             val fbRes = ttsEngine.synthesizeSpeech(
@@ -1490,8 +1406,6 @@ class VideoProcessingPipeline(
 
         if (isLiveEngine) {
             val livePcmFile = storageManager.createAudioOutputFile(projectId, "commentary_live_raw.pcm")
-            
-            // Dynamic Persona Prompt: Uses the exact character instruction provided in the Master JSON
             val characterPersona = if (!tone.isNullOrBlank()) {
                 "$tone. Recite the following script verbatim."
             } else {
