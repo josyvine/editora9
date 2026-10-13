@@ -184,10 +184,11 @@ class Media3TransformerEngine(private val context: Context) {
 
     /**
      * Comprehensive production export pass:
-     * 1. Purges original copyrighted audio track from all video segments.
-     * 2. Muxes synthesized TTS audio track as the sole soundtrack.
+     * 1. Purges original copyrighted audio track from all video segments (or preserves natural room sound if keepOriginalAudio = true).
+     * 2. Muxes synthesized TTS audio track as designated.
      * 3. Applies hardware-accelerated Speed Ramping, GPU Shaders, and dynamic Canvas Overlays.
      * 4. Renders Presentation Text Cards (Instruction & Conclusion Slates).
+     * 5. Multi-track parallel composition for clone & composite effects.
      */
     suspend fun exportVideo(
         inputUri: Uri,
@@ -273,14 +274,42 @@ class Media3TransformerEngine(private val context: Context) {
             sharedVideoEffects.add(OverlayEffect(ImmutableList.copyOf(overlayList)))
         }
 
-        val shouldStripAudio = stripOriginalAudio || (commentaryAudioUri != null)
+        // Strictly honor stripOriginalAudio: when false (keepOriginalAudio = true), retain room sound
+        val shouldStripAudio = stripOriginalAudio
 
         val masterSequenceList = mutableListOf<EditedMediaItemSequence>()
 
-        // 6. Build the Base Video Sequence (Stream 1)
-        val baseSequence = if (speedRamps.isNotEmpty()) {
+        // 6. Build the Base Video Sequence (Track 1)
+        val baseSequence = if (compositeLayers.isNotEmpty()) {
+            // CLONE MODE: Clip Track 1 to Take 1 (Right Clone)
+            val baseLayer = compositeLayers.firstOrNull { it.layerOrder == 0 }
+            val firstOverlayLayer = compositeLayers.firstOrNull { it.layerOrder > 0 } ?: compositeLayers.first()
+            val overlayDuration = firstOverlayLayer.getResolvedEndMs() - firstOverlayLayer.getResolvedStartMs()
+
+            val baseStartMs = baseLayer?.getResolvedStartMs() ?: 0L
+            val baseEndMs = baseLayer?.getResolvedEndMs()?.takeIf { it > baseStartMs }
+                ?: if (overlayDuration > 0L) (baseStartMs + overlayDuration) else getVideoDurationMs(inputUri)
+
+            val baseMediaItem = MediaItem.Builder()
+                .setUri(inputUri)
+                .setClippingConfiguration(
+                    MediaItem.ClippingConfiguration.Builder()
+                        .setStartPositionMs(baseStartMs)
+                        .setEndPositionMs(baseEndMs)
+                        .build()
+                )
+                .build()
+
+            val editedBaseItem = EditedMediaItem.Builder(baseMediaItem)
+                .setRemoveAudio(shouldStripAudio)
+                .setEffects(Effects(emptyList(), sharedVideoEffects))
+                .build()
+
+            EditedMediaItemSequence(editedBaseItem)
+        } else if (speedRamps.isNotEmpty()) {
             buildSpeedRampedSequence(inputUri, shouldStripAudio, speedRamps, sharedVideoEffects)
         } else {
+            // Standard single sequence (Non-clone)
             val videoMediaItem = MediaItem.fromUri(inputUri)
             val editedVideoItem = EditedMediaItem.Builder(videoMediaItem)
                 .setRemoveAudio(shouldStripAudio)
@@ -290,7 +319,7 @@ class Media3TransformerEngine(private val context: Context) {
         }
         masterSequenceList.add(baseSequence)
 
-        // 7. Add Parallel Overlay Video Sequences if Composite Layers exist (Stream 2+)
+        // 7. Add Parallel Overlay Video Sequences if Composite Layers exist (Track 2+)
         if (compositeLayers.isNotEmpty()) {
             val sourceUriToUse = overlaySourceUri ?: inputUri
             for (layer in compositeLayers) {
@@ -300,9 +329,9 @@ class Media3TransformerEngine(private val context: Context) {
                     
                     if (maskDto != null) {
                         val resolvedMaskType = when (maskDto.shape.lowercase()) {
-                            "linear_vertical" -> CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
+                            "linear_vertical", "vertical" -> CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
                             "rectangle" -> CompositeMaskGlEffect.MaskType.RECTANGLE
-                            "radial_circle" -> CompositeMaskGlEffect.MaskType.RADIAL_CIRCLE
+                            "radial_circle", "circle" -> CompositeMaskGlEffect.MaskType.RADIAL_CIRCLE
                             else -> CompositeMaskGlEffect.MaskType.LINEAR_HORIZONTAL
                         }
 
@@ -325,19 +354,46 @@ class Media3TransformerEngine(private val context: Context) {
                                 feather = maskDto.featherRadius.coerceIn(0.0001f, 0.5f),
                                 isInverted = maskDto.isInverted,
                                 rectBounds = boundsArray,
-                                startTimeUs = 0L, // Handled automatically by sequence timing
+                                startTimeUs = 0L, // Aligns overlay start to t=0 of sequence
+                                endTimeUs = Long.MAX_VALUE
+                            )
+                        )
+                    } else {
+                        // Default vertical split mask for clone overlay (splits screen at 50% with feather)
+                        overlayEffects.add(
+                            CompositeMaskGlEffect(
+                                maskType = CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL,
+                                startSplitPos = 0.50f,
+                                endSplitPos = 0.50f,
+                                feather = 0.05f,
+                                isInverted = false,
+                                rectBounds = floatArrayOf(0f, 0f, 1f, 1f),
+                                startTimeUs = 0L,
                                 endTimeUs = Long.MAX_VALUE
                             )
                         )
                     }
 
-                    // Apply the same global aspect ratio/scaling to the overlay
+                    // Apply matching global presentation and grading to Track 2
                     when (targetAspectRatio) {
                         "9:16" -> overlayEffects.add(0, Presentation.createForAspectRatio(9f / 16f, Presentation.LAYOUT_SCALE_TO_FIT))
                         "16:9" -> overlayEffects.add(0, Presentation.createForAspectRatio(16f / 9f, Presentation.LAYOUT_SCALE_TO_FIT))
                         "1:1" -> overlayEffects.add(0, Presentation.createForAspectRatio(1f, Presentation.LAYOUT_SCALE_TO_FIT))
                     }
 
+                    if (zoomScale > 1.0f) {
+                        overlayEffects.add(
+                            ScaleAndRotateTransformation.Builder()
+                                .setScale(zoomScale, zoomScale)
+                                .build()
+                        )
+                    }
+
+                    if (colorGrade != null) {
+                        overlayEffects.add(ColorFilterGlEffect(colorGrade))
+                    }
+
+                    // Track 2 clips raw file at Take 2 (e.g., 16.5s to 21.5s); Media3 automatically presents it starting at t=0
                     val overlayMediaItem = MediaItem.Builder()
                         .setUri(sourceUriToUse)
                         .setClippingConfiguration(
@@ -349,7 +405,7 @@ class Media3TransformerEngine(private val context: Context) {
                         .build()
 
                     val editedOverlayItem = EditedMediaItem.Builder(overlayMediaItem)
-                        .setRemoveAudio(shouldStripAudio) // Keep original audio behavior synced
+                        .setRemoveAudio(true) // Prevent duplicate echo/room-noise phase clash
                         .setEffects(Effects(emptyList(), overlayEffects))
                         .build()
 
