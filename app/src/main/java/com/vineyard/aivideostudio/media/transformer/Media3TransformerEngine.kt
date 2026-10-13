@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
@@ -228,7 +229,7 @@ class Media3TransformerEngine(private val context: Context) {
 
         val overlayList = mutableListOf<TextureOverlay>()
 
-        // 1. CLONE OVERLAY: Bakes Take 2 (Left Clone) directly into the video frames
+        // 1. CLONE OVERLAY: Bakes Take 2 (Left Clone) with upright rotation & cutout into video frames
         if (compositeLayers.isNotEmpty() && overlaySourceUri != null) {
             val overlayFile = runCatching {
                 if (overlaySourceUri.scheme == "file") File(overlaySourceUri.path ?: "") else File(overlaySourceUri.path ?: "")
@@ -279,7 +280,7 @@ class Media3TransformerEngine(private val context: Context) {
         val shouldStripAudio = stripOriginalAudio
         val masterSequenceList = mutableListOf<EditedMediaItemSequence>()
 
-        // 2. Build Master Video Sequence (Single video stream with overlays baked into the pixels)
+        // 2. Build Base Video Sequence (Track 1: Right Clone with Left Clone baked in)
         val baseSequence = if (compositeLayers.isNotEmpty()) {
             val baseLayer = compositeLayers.firstOrNull { it.layerOrder == 0 }
             val firstOverlayLayer = compositeLayers.firstOrNull { it.layerOrder > 0 } ?: compositeLayers.first()
@@ -317,7 +318,16 @@ class Media3TransformerEngine(private val context: Context) {
         }
         masterSequenceList.add(baseSequence)
 
-        // 3. Audio Track
+        // 3. MIX TAKE 2 AUDIO: Injects Take 2's dialogue ("My name is Josyvine") so both clones are heard
+        if (compositeLayers.isNotEmpty() && overlaySourceUri != null && !shouldStripAudio) {
+            val overlayAudioItem = MediaItem.fromUri(overlaySourceUri)
+            val editedOverlayAudio = EditedMediaItem.Builder(overlayAudioItem)
+                .setRemoveVideo(true)
+                .build()
+            masterSequenceList.add(EditedMediaItemSequence(editedOverlayAudio))
+        }
+
+        // 4. Injects Commentary Audio if present
         val isCommentaryAudioValid = commentaryAudioUri != null && try {
             val path = commentaryAudioUri.path ?: ""
             val f = File(path)
@@ -334,7 +344,6 @@ class Media3TransformerEngine(private val context: Context) {
             masterSequenceList.add(EditedMediaItemSequence(editedAudioItem))
         }
 
-        // Single Unified Stream (100% visible in VLC, Gallery, and all media players)
         val composition = Composition.Builder(masterSequenceList).build()
         runTransformer(composition, outputFile)
     }
@@ -529,7 +538,7 @@ class Media3TransformerEngine(private val context: Context) {
 
     /**
      * Renders the secondary clone take directly into the frame buffer as an OpenGL overlay.
-     * Guarantees that both clones are 100% visible in a single video stream in all media players.
+     * Corrects phone portrait 90° sensor rotation so the clone is upright and proportionate.
      */
     private class CloneVideoBitmapOverlay(
         private val overlayVideoFile: File,
@@ -544,6 +553,14 @@ class Media3TransformerEngine(private val context: Context) {
             setDataSource(overlayVideoFile.absolutePath)
         }
 
+        private val rotationDegrees: Int = try {
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+        } catch (_: Exception) { 0 }
+
+        private val rotationMatrix: Matrix? = if (rotationDegrees != 0) {
+            Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+        } else null
+
         private val outputBitmap: Bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
         private val canvas: Canvas = Canvas(outputBitmap)
         private val paint: Paint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -553,11 +570,20 @@ class Media3TransformerEngine(private val context: Context) {
 
         override fun getBitmap(presentationTimeUs: Long): Bitmap {
             outputBitmap.eraseColor(Color.TRANSPARENT)
-            val frame = retriever.getFrameAtTime(presentationTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            val rawFrame = retriever.getFrameAtTime(presentationTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                 ?: return outputBitmap
 
-            val scaledFrame = Bitmap.createScaledBitmap(frame, targetWidth, targetHeight, true)
-            if (frame != scaledFrame) frame.recycle()
+            // CRITICAL FIX: Rotate sideways raw frame upright before scaling to target resolution
+            val uprightFrame = if (rotationMatrix != null) {
+                Bitmap.createBitmap(rawFrame, 0, 0, rawFrame.width, rawFrame.height, rotationMatrix, true).also {
+                    if (it != rawFrame) rawFrame.recycle()
+                }
+            } else {
+                rawFrame
+            }
+
+            val scaledFrame = Bitmap.createScaledBitmap(uprightFrame, targetWidth, targetHeight, true)
+            if (uprightFrame != scaledFrame) uprightFrame.recycle()
 
             if (isCutout && maskBitmapProvider != null) {
                 val mask = maskBitmapProvider.invoke(presentationTimeUs)
@@ -567,14 +593,12 @@ class Media3TransformerEngine(private val context: Context) {
                     canvas.drawBitmap(scaledMask, 0f, 0f, maskPaint)
                     if (mask != scaledMask) scaledMask.recycle()
                 } else {
-                    // Fallback to left half (Left Clone)
                     val splitPx = (targetWidth * splitX).toInt()
                     val srcRect = Rect(0, 0, splitPx, targetHeight)
                     val dstRect = Rect(0, 0, splitPx, targetHeight)
                     canvas.drawBitmap(scaledFrame, srcRect, dstRect, paint)
                 }
             } else {
-                // Left half split screen (Left Clone)
                 val splitPx = (targetWidth * splitX).toInt()
                 val srcRect = Rect(0, 0, splitPx, targetHeight)
                 val dstRect = Rect(0, 0, splitPx, targetHeight)
