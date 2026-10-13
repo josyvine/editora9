@@ -1,7 +1,9 @@
 package com.vineyard.aivideostudio.media.transformer.effects
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.opengl.GLES20
+import android.opengl.GLUtils
 import androidx.annotation.OptIn
 import androidx.media3.common.util.GlProgram
 import androidx.media3.common.util.GlUtil
@@ -13,8 +15,8 @@ import androidx.media3.effect.SingleFrameGlShaderProgram
 
 /**
  * High-performance GPU-accelerated OpenGL ES 2.0 Effect for Media3 Transformer.
- * Performs dynamic feathered masking for clones, traveling mattes (near-miss stunts),
- * wipes, and object transitions directly on hardware surfaces.
+ * Performs dynamic feathered masking for clones, traveling mattes, wipes,
+ * and AI Subject Cutout (CapCut-style Auto Background Removal) directly on hardware surfaces.
  */
 @UnstableApi
 class CompositeMaskGlEffect(
@@ -25,14 +27,16 @@ class CompositeMaskGlEffect(
     val isInverted: Boolean = false,
     val rectBounds: FloatArray = floatArrayOf(0f, 0f, 1f, 1f), // xMin, yMin, xMax, yMax
     val startTimeUs: Long = 0L,
-    val endTimeUs: Long = Long.MAX_VALUE
+    val endTimeUs: Long = Long.MAX_VALUE,
+    val maskBitmapProvider: ((Long) -> Bitmap?)? = null // AI Cutout Matte Provider per frame
 ) : GlEffect {
 
     enum class MaskType(val typeId: Float) {
-        LINEAR_HORIZONTAL(0.0f), // Top vs Bottom split (e.g. Toddler & Beanbag)
-        LINEAR_VERTICAL(1.0f),   // Left vs Right split (e.g. Talking to your Clone)
+        LINEAR_HORIZONTAL(0.0f), // Top vs Bottom split
+        LINEAR_VERTICAL(1.0f),   // Left vs Right split
         RECTANGLE(2.0f),         // Bounding Box matte
-        RADIAL_CIRCLE(3.0f)      // Circular spotlight / portal matte
+        RADIAL_CIRCLE(3.0f),     // Circular spotlight / portal matte
+        AI_SUBJECT_MATTE(4.0f)   // CapCut-style AI background removal (body cutout)
     }
 
     @OptIn(UnstableApi::class)
@@ -49,6 +53,7 @@ internal class CompositeMaskShaderProgram(
 ) : SingleFrameGlShaderProgram(useHdr) {
 
     private val glProgram: GlProgram
+    private var maskTexId: Int = 0
 
     companion object {
         private const val VERTEX_SHADER = """
@@ -64,12 +69,14 @@ internal class CompositeMaskShaderProgram(
             precision mediump float;
             varying vec2 vTexCoords;
             uniform sampler2D uTexSampler;
+            uniform sampler2D uMaskSampler;
             uniform float uMaskType;
             uniform float uSplitPos;
             uniform float uFeather;
             uniform float uInvert;
             uniform float uIsActive;
             uniform vec4 uRectBounds;
+            uniform float uHasMaskTex;
 
             void main() {
                 vec4 baseColor = texture2D(uTexSampler, vTexCoords);
@@ -94,10 +101,19 @@ internal class CompositeMaskShaderProgram(
                     float top = smoothstep(uRectBounds.y - feather, uRectBounds.y + feather, vTexCoords.y);
                     float bottom = 1.0 - smoothstep(uRectBounds.w - feather, uRectBounds.w + feather, vTexCoords.y);
                     alpha = left * right * top * bottom;
-                } else {
+                } else if (uMaskType < 3.5) {
                     // Radial Circle
                     float dist = distance(vTexCoords, vec2(0.5, 0.5));
                     alpha = 1.0 - smoothstep(uSplitPos - feather, uSplitPos + feather, dist);
+                } else {
+                    // AI Subject Matte Cutout (CapCut-style Auto Background Removal)
+                    if (uHasMaskTex > 0.5) {
+                        vec4 maskVal = texture2D(uMaskSampler, vTexCoords);
+                        // Supports alpha or grayscale luminance channel from ML Kit segmentation
+                        alpha = max(maskVal.r, maskVal.a);
+                    } else {
+                        alpha = 1.0;
+                    }
                 }
 
                 if (uInvert > 0.5) {
@@ -116,6 +132,17 @@ internal class CompositeMaskShaderProgram(
             GlUtil.getNormalizedCoordinateBounds(),
             GlUtil.HOMOGENEOUS_COORDINATE_VECTOR_SIZE
         )
+
+        // Generate standard OpenGL texture handle for the AI cutout mask
+        val textures = IntArray(1)
+        GLES20.glGenTextures(1, textures, 0)
+        maskTexId = textures[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTexId)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
     }
 
     override fun configure(inputWidth: Int, inputHeight: Int): Size {
@@ -125,7 +152,6 @@ internal class CompositeMaskShaderProgram(
     override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
         val isActive = presentationTimeUs in effect.startTimeUs..effect.endTimeUs
 
-        // Dynamically interpolate split position over time if animating
         val currentSplitPos = if (isActive && effect.endTimeUs > effect.startTimeUs) {
             val progress = ((presentationTimeUs - effect.startTimeUs).toFloat() /
                     (effect.endTimeUs - effect.startTimeUs).toFloat()).coerceIn(0f, 1f)
@@ -142,12 +168,33 @@ internal class CompositeMaskShaderProgram(
         glProgram.setFloatUniform("uInvert", if (effect.isInverted) 1.0f else 0.0f)
         glProgram.setFloatUniform("uIsActive", if (isActive) 1.0f else 0.0f)
         glProgram.setFloatsUniform("uRectBounds", effect.rectBounds)
+
+        // Bind AI Cutout Alpha Mask Texture if active
+        if (effect.maskType == CompositeMaskGlEffect.MaskType.AI_SUBJECT_MATTE && effect.maskBitmapProvider != null) {
+            val maskBitmap = effect.maskBitmapProvider.invoke(presentationTimeUs)
+            if (maskBitmap != null && !maskBitmap.isRecycled) {
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTexId)
+                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, maskBitmap, 0)
+                glProgram.setSamplerTexIdUniform("uMaskSampler", maskTexId, 1)
+                glProgram.setFloatUniform("uHasMaskTex", 1.0f)
+            } else {
+                glProgram.setFloatUniform("uHasMaskTex", 0.0f)
+            }
+        } else {
+            glProgram.setFloatUniform("uHasMaskTex", 0.0f)
+        }
+
         glProgram.bindAttributesAndUniforms()
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
 
     override fun release() {
         super.release()
+        if (maskTexId != 0) {
+            GLES20.glDeleteTextures(1, intArrayOf(maskTexId), 0)
+            maskTexId = 0
+        }
         try {
             glProgram.delete()
         } catch (_: Exception) {}
