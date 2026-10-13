@@ -188,7 +188,7 @@ class Media3TransformerEngine(private val context: Context) {
      * 2. Muxes synthesized TTS audio track as designated.
      * 3. Applies hardware-accelerated Speed Ramping, GPU Shaders, and dynamic Canvas Overlays.
      * 4. Renders Presentation Text Cards (Instruction & Conclusion Slates).
-     * 5. Multi-track parallel composition for clone & composite effects.
+     * 5. Multi-track parallel composition with CapCut-style AI Subject Cutouts (Auto Removal).
      */
     suspend fun exportVideo(
         inputUri: Uri,
@@ -207,7 +207,8 @@ class Media3TransformerEngine(private val context: Context) {
         compositeLayers: List<RecipeCompositeLayerDto> = emptyList(),
         videoWidth: Int? = null,
         videoHeight: Int? = null,
-        overlaySourceUri: Uri? = null
+        overlaySourceUri: Uri? = null,
+        maskBitmapProvider: ((Long) -> Bitmap?)? = null
     ): AppResult<File> = withContext(Dispatchers.Main) {
         outputFile.parentFile?.mkdirs()
         if (outputFile.exists()) outputFile.delete()
@@ -317,7 +318,7 @@ class Media3TransformerEngine(private val context: Context) {
         }
         masterSequenceList.add(baseSequence)
 
-        // 7. Add Parallel Overlay Video Sequences if Composite Layers exist (Track 2+: Left Clone)
+        // 7. Add Parallel Overlay Video Sequences if Composite Layers exist (Track 2+: Left Clone Cutout)
         if (compositeLayers.isNotEmpty()) {
             val sourceUriToUse = overlaySourceUri ?: inputUri
             val isPreTrimmed = overlaySourceUri != null
@@ -326,53 +327,49 @@ class Media3TransformerEngine(private val context: Context) {
                 if (layer.layerOrder > 0) {
                     val overlayEffects = mutableListOf<Effect>()
                     val maskDto = layer.mask
-                    
-                    if (maskDto != null) {
-                        val resolvedMaskType = when (maskDto.shape.lowercase()) {
+
+                    val boundsArray = if (maskDto?.bounds != null) {
+                        floatArrayOf(
+                            maskDto.bounds.left.coerceIn(0.0f, 1.0f),
+                            maskDto.bounds.top.coerceIn(0.0f, 1.0f),
+                            maskDto.bounds.right.coerceIn(0.0f, 1.0f),
+                            maskDto.bounds.bottom.coerceIn(0.0f, 1.0f)
+                        )
+                    } else {
+                        floatArrayOf(0f, 0f, 1f, 1f)
+                    }
+
+                    // Determine whether AI Subject Cutout or a Geometric Mask is requested
+                    val isAiCutout = maskBitmapProvider != null ||
+                            maskDto?.shape.equals("ai_subject_cutout", ignoreCase = true) ||
+                            maskDto?.shape.equals("auto_removal", ignoreCase = true)
+
+                    val resolvedMaskType = if (isAiCutout) {
+                        CompositeMaskGlEffect.MaskType.AI_SUBJECT_MATTE
+                    } else if (maskDto != null) {
+                        when (maskDto.shape.lowercase()) {
                             "linear_vertical", "vertical" -> CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
                             "rectangle" -> CompositeMaskGlEffect.MaskType.RECTANGLE
                             "radial_circle", "circle" -> CompositeMaskGlEffect.MaskType.RADIAL_CIRCLE
                             else -> CompositeMaskGlEffect.MaskType.LINEAR_HORIZONTAL
                         }
-
-                        val boundsArray = if (maskDto.bounds != null) {
-                            floatArrayOf(
-                                maskDto.bounds.left.coerceIn(0.0f, 1.0f),
-                                maskDto.bounds.top.coerceIn(0.0f, 1.0f),
-                                maskDto.bounds.right.coerceIn(0.0f, 1.0f),
-                                maskDto.bounds.bottom.coerceIn(0.0f, 1.0f)
-                            )
-                        } else {
-                            floatArrayOf(0f, 0f, 1f, 1f)
-                        }
-
-                        overlayEffects.add(
-                            CompositeMaskGlEffect(
-                                maskType = resolvedMaskType,
-                                startSplitPos = maskDto.startSplitPos.coerceIn(0.0f, 1.0f),
-                                endSplitPos = maskDto.endSplitPos.coerceIn(0.0f, 1.0f),
-                                feather = maskDto.featherRadius.coerceIn(0.0001f, 0.5f),
-                                isInverted = maskDto.isInverted,
-                                rectBounds = boundsArray,
-                                startTimeUs = 0L,
-                                endTimeUs = Long.MAX_VALUE
-                            )
-                        )
                     } else {
-                        // Default vertical split mask for clone overlay: isInverted = true ensures the Left Clone is visible
-                        overlayEffects.add(
-                            CompositeMaskGlEffect(
-                                maskType = CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL,
-                                startSplitPos = 0.48f,
-                                endSplitPos = 0.48f,
-                                feather = 0.03f,
-                                isInverted = true,
-                                rectBounds = floatArrayOf(0f, 0f, 1f, 1f),
-                                startTimeUs = 0L,
-                                endTimeUs = Long.MAX_VALUE
-                            )
-                        )
+                        CompositeMaskGlEffect.MaskType.LINEAR_VERTICAL
                     }
+
+                    overlayEffects.add(
+                        CompositeMaskGlEffect(
+                            maskType = resolvedMaskType,
+                            startSplitPos = maskDto?.startSplitPos ?: 0.48f,
+                            endSplitPos = maskDto?.endSplitPos ?: 0.48f,
+                            feather = maskDto?.featherRadius ?: 0.03f,
+                            isInverted = maskDto?.isInverted ?: false,
+                            rectBounds = boundsArray,
+                            startTimeUs = 0L,
+                            endTimeUs = Long.MAX_VALUE,
+                            maskBitmapProvider = maskBitmapProvider
+                        )
+                    )
 
                     when (targetAspectRatio) {
                         "9:16" -> overlayEffects.add(0, Presentation.createForAspectRatio(9f / 16f, Presentation.LAYOUT_SCALE_TO_FIT))
@@ -433,7 +430,7 @@ class Media3TransformerEngine(private val context: Context) {
             masterSequenceList.add(EditedMediaItemSequence(editedAudioItem))
         }
 
-        // Standard Media3 Composition for your library version
+        // Standard Media3 Composition (Clean build without unsupported APIs)
         val composition = Composition.Builder(masterSequenceList).build()
         runTransformer(composition, outputFile)
     }
