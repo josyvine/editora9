@@ -2,6 +2,7 @@ package com.vineyard.aivideostudio.domain.pipeline
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import com.google.android.gms.tasks.Tasks
@@ -605,7 +606,7 @@ class VideoProcessingPipeline(
 
         // 1. SPLICE HIGHLIGHTS (Bypassed if audioOnlyMode is true OR if composite layers exist)
         // CRITICAL FIX: If compositeLayers exist (clone mode), completely bypass highlight splicing.
-        // This ensures the source video remains 100% intact so Track 2 can access Take 2 (e.g., 15s to 23.5s).
+        // This ensures the source video remains 100% intact so Track 2 can access Take 2 (e.g., 16s to 21.2s).
         if (!recipe.audioOnlyMode && !hasCompositeLayers) {
             val highlightSegments = recipe.editingPlan.segmentsToKeep.map { it.toHighlightSegment() }
             if (highlightSegments.isNotEmpty()) {
@@ -916,22 +917,23 @@ class VideoProcessingPipeline(
                 logger.log(
                     projectId,
                     PipelineStatus.TRIM_EXECUTION,
-                    "Pre-trimming overlay take ($overlayStartMs ms to $overlayEndMs ms) to prevent decoder seek deadlock...",
+                    "Pre-trimming overlay take ($overlayStartMs ms to $overlayEndMs ms) with audio preserved...",
                     LogSeverity.INFO
                 )
+                // CRITICAL FIX: stripAudio = false preserves Take 2's dialogue ("My name is Josyvine")
                 val preTrimResult = transformerEngine.trimVideo(
                     inputUri = Uri.parse(currentVideoUri),
                     outputFile = tempOverlayFile,
                     startMs = overlayStartMs,
                     endMs = overlayEndMs,
-                    stripAudio = true
+                    stripAudio = false
                 )
                 if (preTrimResult is AppResult.Success && tempOverlayFile.exists() && tempOverlayFile.length() > 0L) {
                     resolvedOverlayUri = Uri.fromFile(tempOverlayFile)
                     logger.log(
                         projectId,
                         PipelineStatus.TRIM_EXECUTION,
-                        "Pre-trimmed overlay take ready (${tempOverlayFile.length()} bytes) at t=0.",
+                        "Pre-trimmed overlay take ready (${tempOverlayFile.length()} bytes) with audio.",
                         LogSeverity.SUCCESS
                     )
 
@@ -1034,7 +1036,7 @@ class VideoProcessingPipeline(
 
     /**
      * Extracts on-device Google ML Kit Subject Segmentation masks for each frame of the overlay take.
-     * Operates offline on Android hardware to isolate the person and eliminate all background.
+     * Rotates frames upright so ML Kit accurately detects and segments the human body without distortion.
      */
     private suspend fun extractAiSubjectMasks(
         videoFile: File,
@@ -1045,6 +1047,15 @@ class VideoProcessingPipeline(
 
         return@withContext try {
             retriever.setDataSource(videoFile.absolutePath)
+            
+            // Extract sensor rotation (e.g. 90° portrait)
+            val rotationDegrees = try {
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            } catch (_: Exception) { 0 }
+            val rotationMatrix = if (rotationDegrees != 0) {
+                Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+            } else null
+
             val segmenterOptions = SubjectSegmenterOptions.Builder()
                 .enableForegroundBitmap()
                 .build()
@@ -1055,10 +1066,19 @@ class VideoProcessingPipeline(
 
             while (timeCursorMs <= durationMs) {
                 val timeUs = timeCursorMs * 1000L
-                val frameBitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                if (frameBitmap != null) {
+                val rawFrame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                if (rawFrame != null) {
                     try {
-                        val inputImage = InputImage.fromBitmap(frameBitmap, 0)
+                        // CRITICAL FIX: Rotate frame upright so ML Kit recognizes an upright human body
+                        val uprightFrame = if (rotationMatrix != null) {
+                            Bitmap.createBitmap(rawFrame, 0, 0, rawFrame.width, rawFrame.height, rotationMatrix, true).also {
+                                if (it != rawFrame) rawFrame.recycle()
+                            }
+                        } else {
+                            rawFrame
+                        }
+
+                        val inputImage = InputImage.fromBitmap(uprightFrame, 0)
                         val result = Tasks.await(segmenter.process(inputImage))
                         val fgBitmap = result.foregroundBitmap
                         if (fgBitmap != null) {
@@ -1066,7 +1086,7 @@ class VideoProcessingPipeline(
                         }
                     } catch (_: Exception) {
                     } finally {
-                        frameBitmap.recycle()
+                        rawFrame.recycle()
                     }
                 }
                 timeCursorMs += frameStepMs
@@ -1076,10 +1096,9 @@ class VideoProcessingPipeline(
                 logger.log(
                     "AI_CUTOUT",
                     PipelineStatus.TRIM_EXECUTION,
-                    "Generated ${maskMap.size} AI subject cutout masks across ${durationMs}ms.",
+                    "Generated ${maskMap.size} upright AI subject cutout masks across ${durationMs}ms.",
                     LogSeverity.SUCCESS
                 )
-                // Frame lookup lambda: matches presentation timestamp to nearest mask in nanoseconds
                 val provider: (Long) -> Bitmap? = { presentationTimeUs ->
                     val floor = maskMap.floorEntry(presentationTimeUs)
                     val ceiling = maskMap.ceilingEntry(presentationTimeUs)
